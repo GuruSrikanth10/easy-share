@@ -1,0 +1,1121 @@
+diff --git a/.env.example b/.env.example
+index f529d0a..b261f03 100644
+--- a/.env.example
++++ b/.env.example
+@@ -457,6 +457,35 @@ HF_MODEL_SIMPLE=Qwen/Qwen3-VL-235B-A22B-Instruct-FP8
+ # configure them independently. In a split-pod deployment each role's own
+ # Deployment manifest sets only the variables it reads.
+ 
++# --- Which consumers start.py starts on this instance ---
++# Each lane has a fetch stage and an analysis stage, and each stage is a
++# consumer of its own: fast_consumer.py and slow_consumer.py for rejections,
++# dlt_consumer.py and dlt_analysis_consumer.py for dead letters. start.py
++# starts the API beside the consumers of every lane switched on, at every
++# stage switched on (src/utils/consumer_roles.py). As below, that is both
++# rejection consumers, and both DLT consumers as well under DLT_ENABLED=true
++# (the DLT lane's switch, in the DLT block).
++#
++# To run one image as separate deployments, each sized for its own work:
++#
++#   fetch both lanes:      REJECTION_ENABLED=true     DLT_ENABLED=true
++#                          FETCH_STAGE_ENABLED=true   ANALYSIS_STAGE_ENABLED=false
++#   analyse rejections:    REJECTION_ENABLED=true     DLT_ENABLED=false
++#                          FETCH_STAGE_ENABLED=false  ANALYSIS_STAGE_ENABLED=true
++#   analyse dead letters:  REJECTION_ENABLED=false    DLT_ENABLED=true
++#                          FETCH_STAGE_ENABLED=false  ANALYSIS_STAGE_ENABLED=true
++#
++# A lane whose two stages run on different instances needs
++# CASEBOOK_STORAGE_BACKEND=s3 on both: the analysis instance reads the logs
++# and status the fetch instance saved, and start.py refuses to start a split
++# lane on any other backend. Only the analysis stage uses the agent tool
++# server, so the fetch instance can set AGENT_MCP_SERVE=false. Each switch is
++# true or false (1/0 and yes/no also work); anything else is refused, and so
++# is a combination that starts no consumer at all.
++REJECTION_ENABLED=true
++FETCH_STAGE_ENABLED=true
++ANALYSIS_STAGE_ENABLED=true
++
+ KAFKA_CONSUMER_BROKERS=localhost:9092
+ 
+ # The UTC offset the packet producers write zoneless times in: the payload's
+@@ -940,11 +969,12 @@ DLT_REFID_PATHS_BY_TYPE=
+ DLT_REFID_KEYS=refId,ref_id,referenceId
+ 
+ # --- DLT Analysis -- Phase 4 (consumers) ---
+-# Master switch for start.py's single-host supervisor. Off by default: a
+-# deployment with no dead-letter topic would otherwise start consumers that
+-# fail to subscribe, and the supervisor tears down everything when a child
+-# exits. In a split-pod deployment each role's manifest runs its own
+-# entrypoint and this is irrelevant.
++# The DLT lane's switch in start.py, beside REJECTION_ENABLED,
++# FETCH_STAGE_ENABLED and ANALYSIS_STAGE_ENABLED (Kafka section): on, start.py
++# starts the DLT consumer of each stage switched on -- both, unless a stage
++# switch says otherwise. Off by default: a deployment with no dead-letter
++# topic would otherwise start consumers that fail to subscribe, and the
++# supervisor tears down everything when a child exits.
+ DLT_ENABLED=false
+ 
+ # DLT consumer (dead-letter topics -> /fetch-dlt-logs). Bounded I/O, no LLM.
+diff --git a/ARCHITECTURE.md b/ARCHITECTURE.md
+index 25af985..bd7f856 100644
+--- a/ARCHITECTURE.md
++++ b/ARCHITECTURE.md
+@@ -701,8 +701,10 @@ agentic-resident-crm/
+ ├── REMEDIATION_PLAN_2026_08_21.md  # 2026-08-21 codebase audit remediation programme
+ ├── REASON_CODE_DOCS_PLAN.md        # Reason-code documentation for the rejection lane: plan
+ │                                   #   (document store, rollout)
+-├── start.py                        # Process supervisor: spawns main_api.py + fast_consumer.py + slow_consumer.py
+-│                                   #   (+ the two DLT consumers when DLT_ENABLED=true)
++├── start.py                        # Process supervisor: spawns main_api.py + the consumers this
++│                                   #   instance runs: fast_consumer.py + slow_consumer.py by
++│                                   #   default (+ the two DLT consumers when DLT_ENABLED=true);
++│                                   #   lanes and stages switch apart (section 3.11.1)
+ ├── local_run.py                    # CLI: POST a local packet JSON to the running API
+ ├── rules.csv                       # Rules DB export consumed by check_drift.py (gitignored;
+ │                                   #   operator-generated, not checked in)
+@@ -998,6 +1000,8 @@ agentic-resident-crm/
+ │       ├── service_registry.py     # Service packs, which service a packet belongs to, and
+ │       │                           #   the intake gate (section 3.2.3)
+ │       ├── config_validator.py     # Fail-fast boot-time configuration validation
++│       ├── consumer_roles.py       # Which consumers start.py starts: lane and stage switches
++│       │                           #   (section 3.11.1)
+ │       ├── logging_config.py       # structlog JSON logging setup
+ │       ├── kafkaConsumer.py        # Background topic polling + bounded worker pool (CONSUMER_ROLE=fast|slow|dlt|dlt_analysis)
+ │       ├── message_adapters.py     # Per-role record handling: rejection payload vs DLT case
+@@ -2317,13 +2321,17 @@ the artifact's presence (not its content) is what fetch_logs_node checks,
+ even the "disabled"/"no logs found" sentinel strings are cached and treated
+ as a completed fetch, never re-attempted.
+ 
+-**Local development:** `start.py` spawns all three processes (API,
+-`fast_consumer.py`, `slow_consumer.py`); no special per-child environment is
+-needed since each consumer sets its own `CONSUMER_ROLE`. When
+-the API runs its own agent tool server, `start.py` waits for the `/ready`
+-endpoint to return 200 (or a 503 other than the tool server starting or a
+-download of the reason-code documentation or service map) before starting
+-consumers. See section 4.
++**Local development:** `start.py` spawns the API and, by default, both
++rejection consumers (`fast_consumer.py`, `slow_consumer.py`); section 3.11.1
++covers running each lane and stage on an instance of its own. No special
++per-child environment is needed since each consumer sets its own
++`CONSUMER_ROLE`. Before starting any consumer, `start.py` waits for the
++`/ready` endpoint to return 200 (or a 503 other than the agent tool server
++starting or a download of the reason-code documentation or service map),
++whether or not the API runs its own tool server. It used to wait only when it
++did, so an API without one could be sent packets before the service map had
++arrived. If the API exits while it is being waited on, no consumer is
++started and the supervisor exits with the API's code. See section 4.
+ 
+ **The DLT lane repeats this split, not the code.** `dlt_consumer.py` and
+ `dlt_analysis_consumer.py` are two more entry points over the same
+@@ -2335,6 +2343,84 @@ and the DLT analysis route gets its own bounded executor
+ than the same pool, so a DLT backlog cannot starve the rejection lane or vice
+ versa. Section 4.4 covers what actually runs in each.
+ 
++### 3.11.1 Running the lanes and stages on separate instances
++
++`start.py` starts the API and the consumers four switches select
++(`src/utils/consumer_roles.py`). `REJECTION_ENABLED` (default `true`) and
++`DLT_ENABLED` (default `false`) choose the lanes; `FETCH_STAGE_ENABLED` and
++`ANALYSIS_STAGE_ENABLED` (both default `true`) choose which stages of those
++lanes run. A consumer starts when its lane and its stage are both on:
++
++| Consumer | Lane | Stage |
++|---|---|---|
++| `fast_consumer.py` (rejections -> `/fetch-logs`) | rejection | fetch |
++| `slow_consumer.py` (analysis queue -> `/analyze-rejection`) | rejection | analysis |
++| `dlt_consumer.py` (dead-letter topics -> `/fetch-dlt-logs`) | DLT | fetch |
++| `dlt_analysis_consumer.py` (DLT queue -> `/analyze-dlt`) | DLT | analysis |
++
++Left unset, the switches start what `start.py` always did. Set apart, they let
++one image run as separate Deployments, so what runs where, and the CPU,
++memory and replica count each kind of work gets, is chosen per Deployment:
++
++| Deployment | `REJECTION_ENABLED` | `DLT_ENABLED` | `FETCH_STAGE_ENABLED` | `ANALYSIS_STAGE_ENABLED` | Runs |
++|---|---|---|---|---|---|
++| Log fetch, both lanes | `true` | `true` | `true` | `false` | API + `fast_consumer.py` + `dlt_consumer.py` |
++| Rejection analysis | `true` | `false` | `false` | `true` | API + `slow_consumer.py` |
++| DLT analysis | `false` | `true` | `false` | `true` | API + `dlt_analysis_consumer.py` |
++
++Every instance keeps its own API. A consumer only reads Kafka and forwards
++each message to the API over HTTP; the API is what fetches the logs, writes
++the casebook store and runs the agents. A consumer's entry script can be run
++on its own (section 4.1), but then nothing waits for an API to be ready
++before the consumer reads, and a message it cannot forward goes to the DLQ
++(`kafkaConsumer._process_and_commit`).
++
++`start.py` checks the switches before it starts anything, and on any error
++prints every error to stderr and exits 1:
++
++- **A split lane needs `CASEBOOK_STORAGE_BACKEND=s3`.** When an instance runs
++  one stage of a lane but not the other, the two stages hand every packet over
++  through the casebook store. The fetch stage saves `fetched_logs.txt`,
++  `status.json` and the packet's service resolution (in the DLT lane also the
++  headers, trace and deployed-version artifacts), and the analysis stage reads
++  them back. On local storage each instance has only its own disk, so the
++  analysis stage would find none of it and fetch the logs again itself, by
++  when the pods may have rotated them away. Nothing passes between the two
++  lanes, so an instance that runs both stages of each lane it runs needs no
++  shared storage for this. The `API_REPLICA_COUNT > 1` check in
++  `config_validator` does not catch a split: three single-replica Deployments
++  pass it.
++- **At least one consumer.** A combination that selects none is refused rather
++  than left running an idle API. The likeliest case is a DLT analysis instance
++  that turned the rejection lane off and forgot that `DLT_ENABLED` is off by
++  default.
++- **Each switch is `true` or `false`** (`1`/`0` and `yes`/`no` also work;
++  blank is the default). A misspelt value is refused rather than guessed: read
++  as off it would leave a lane unread, and read as on it would start consumers
++  that take a share of the partitions another instance was deployed to read.
++  This now applies to `DLT_ENABLED` too, which used to read any value other
++  than `true`, `1` or `yes` as off.
++
++Notes for separate Deployments:
++
++- Kafka divides a topic's partitions among the members of its consumer group,
++  so the replicas of one Deployment share its work, and replicas beyond a
++  topic's partition count sit idle. The three Deployments above share no
++  consumer group: each consumer runs on one of them only.
++- Neither lane's agents are built until the first analysis (`get_agent()`,
++  `get_dlt_agent()`), and only the analysis stage uses the agent tool server,
++  so the fetch Deployment can set `AGENT_MCP_SERVE=false` and skip that
++  process.
++- `MAX_CONCURRENT_INVESTIGATIONS` (and `MAX_CONCURRENT_DLT_ANALYSES`) is read
++  per process, so set it per Deployment.
++- More than one replica of the rejection analysis Deployment needs
++  `CHECKPOINT_BACKEND=postgres` (or `mysql`) as well as S3, as any API with
++  more than one replica does (section 1.3.4's scope limit).
++- `/health` still reports a heartbeat block for all four consumer roles; a
++  role that does not run on the instance reads `null` ("unknown"), as in any
++  split-pod deployment. Each consumer's own `*_HEALTH_PORT` answers for its
++  liveness.
++
+ ### 3.12 The Kafka payload contract (AUDIT envelope)
+ 
+ From 2026-09-29 the producers publish an AUDIT event instead of the packet
+@@ -2711,16 +2797,19 @@ the upload tool against an in-memory Langfuse with the prompt API's shape
+    `src/slow_consumer.py` (analysis queue -> `/analyze-rejection`) as three
+    separate processes. Setting `DLT_ENABLED=true` additionally spawns
+    `src/dlt_consumer.py` (dead-letter topic -> `/fetch-dlt-logs`) and
+-   `src/dlt_analysis_consumer.py` (DLT queue -> `/analyze-dlt`). See section
+-   3.11 for the fetch/analyze split and section 4.4 for the DLT lane.*
++   `src/dlt_analysis_consumer.py` (DLT queue -> `/analyze-dlt`).
++   `REJECTION_ENABLED`, `FETCH_STAGE_ENABLED` and `ANALYSIS_STAGE_ENABLED`
++   (all default `true`) narrow that down, so one instance can fetch the logs
++   while others run each lane's analysis (section 3.11.1). See section 3.11
++   for the fetch/analyze split and section 4.4 for the DLT lane.*
+ 
+    *When the API runs its own agent tool server, it starts it first, as a
+    supervised child process, and `/ready` returns 503 "Starting agent tool
+    server" until it answers its health check. `start.py` waits for `/ready`
+-   whenever the tool server is coming up, and starts the consumers once it
+-   returns 200 (or a Kafka/checkpoint 503); it keeps waiting through a
+-   download of the reason-code documentation or service map. In a container,
+-   `entrypoint.sh` execs `start.py`.*
++   before starting any consumer, and starts them once it returns 200 (or a
++   Kafka/checkpoint 503); it keeps waiting through a download of the
++   reason-code documentation or service map. In a container, `entrypoint.sh`
++   execs `start.py`.*
+ 
+    To run them individually:
+    ```bash
+@@ -2728,6 +2817,9 @@ the upload tool against an in-memory Langfuse with the prompt API's shape
+    python3 src/fast_consumer.py   # Fast consumer only
+    python3 src/slow_consumer.py   # Slow consumer only
+    ```
++   A consumer run this way forwards to whatever API its endpoint setting
++   names, ready or not, and a message it cannot forward goes to the DLQ;
++   `start.py` is what waits for the API first.
+ 
+ 4. **Testing Pipeline (No Kafka Required):**
+    ```bash
+diff --git a/README.md b/README.md
+index e75b0a2..d59459e 100644
+--- a/README.md
++++ b/README.md
+@@ -598,7 +598,10 @@ agentic-resident-crm/
+ ├── KUBERNETES_LOGS_PLAN.md         # Kubernetes log source: engineering design
+ ├── RUNBOOK_PLAN.md                 # Standard runbook implementation plan
+ ├── REMEDIATION_PLAN_2026_08_21.md  # 2026-08-21 codebase audit remediation programme
+-├── start.py                        # Process supervisor: spawns main_api.py + fast_consumer.py + slow_consumer.py
++├── start.py                        # Process supervisor: spawns main_api.py + the consumers this
++│                                   #   instance runs: fast_consumer.py + slow_consumer.py by
++│                                   #   default (+ the two DLT consumers when DLT_ENABLED=true);
++│                                   #   lanes and stages switch apart (section 3.11.1)
+ ├── local_run.py                    # CLI: POST a local packet JSON to the running API
+ ├── rules.csv                       # Rules DB export consumed by check_drift.py (gitignored;
+ │                                   #   operator-generated, not checked in)
+@@ -801,6 +804,8 @@ agentic-resident-crm/
+ │       ├── packet_claims.py       # One investigation per packet: a create-only claim, so
+ │       │                           #   concurrent duplicates cannot both invoke the graph
+ │       ├── config_validator.py     # Fail-fast boot-time configuration validation
++│       ├── consumer_roles.py       # Which consumers start.py starts: lane and stage switches
++│       │                           #   (section 3.11.1)
+ │       ├── logging_config.py       # structlog JSON logging setup
+ │       ├── kafkaConsumer.py        # Background topic polling + bounded worker pool (CONSUMER_ROLE=fast|slow|dlt|dlt_analysis)
+ │       ├── message_adapters.py     # Per-role record handling: rejection payload vs DLT case
+@@ -1102,9 +1107,14 @@ the artifact's presence (not its content) is what fetch_logs_node checks,
+ even the "disabled"/"no logs found" sentinel strings are cached and treated
+ as a completed fetch, never re-attempted.
+ 
+-**Local development:** `start.py` spawns all three processes (API,
+-`fast_consumer.py`, `slow_consumer.py`); no special per-child environment is
+-needed since each consumer sets its own `CONSUMER_ROLE`. See section 4.
++**Local development:** `start.py` spawns the API and, by default, both
++rejection consumers (`fast_consumer.py`, `slow_consumer.py`); section 3.11.1
++covers running each lane and stage on an instance of its own. No special
++per-child environment is needed since each consumer sets its own
++`CONSUMER_ROLE`. Before starting any consumer, `start.py` waits for `/ready`
++(200, or a 503 other than the agent tool server starting or a reason-code
++download), whether or not the API runs its own tool server, and starts none
++if the API exits while it waits. See section 4.
+ 
+ **The DLT lane repeats this split, not the code.** `dlt_consumer.py` and
+ `dlt_analysis_consumer.py` are two more entry points over the same
+@@ -1116,6 +1126,33 @@ and the DLT analysis route gets its own bounded executor
+ than the same pool, so a DLT backlog cannot starve the rejection lane or vice
+ versa. Section 4.4 covers what actually runs in each.
+ 
++### 3.11.1 Running the lanes and stages on separate instances
++
++`start.py` starts the API and the consumers four switches select
++(`src/utils/consumer_roles.py`): `REJECTION_ENABLED` (default `true`) and
++`DLT_ENABLED` (default `false`) choose the lanes, `FETCH_STAGE_ENABLED` and
++`ANALYSIS_STAGE_ENABLED` (both default `true`) the stages of those lanes. A
++consumer starts when its lane and its stage are both on: `fast_consumer.py`
++is the rejection lane's fetch stage, `slow_consumer.py` its analysis stage,
++`dlt_consumer.py` and `dlt_analysis_consumer.py` the DLT lane's. Left unset,
++the switches start what `start.py` always did. Set apart, they let one image
++run as separate Deployments, each sized for its own work:
++
++| Deployment | `REJECTION_ENABLED` | `DLT_ENABLED` | `FETCH_STAGE_ENABLED` | `ANALYSIS_STAGE_ENABLED` | Runs |
++|---|---|---|---|---|---|
++| Log fetch, both lanes | `true` | `true` | `true` | `false` | API + `fast_consumer.py` + `dlt_consumer.py` |
++| Rejection analysis | `true` | `false` | `false` | `true` | API + `slow_consumer.py` |
++| DLT analysis | `false` | `true` | `false` | `true` | API + `dlt_analysis_consumer.py` |
++
++Every instance keeps its own API, since the consumers only forward to it.
++`start.py` refuses to start (exit 1) on a lane split across instances without
++`CASEBOOK_STORAGE_BACKEND=s3` -- the analysis instance reads the logs and
++status the fetch instance saved -- on a combination that starts no consumer,
++and on a switch that is neither true nor false. The fetch Deployment can set
++`AGENT_MCP_SERVE=false`, since only the analysis stage uses the agent tool
++server. ARCHITECTURE.md section 3.11.1 has the reasoning and the remaining
++deployment notes.
++
+ ---
+ 
+ ## 4. How to Run Locally
+@@ -1158,10 +1195,15 @@ versa. Section 4.4 covers what actually runs in each.
+    `src/slow_consumer.py` (analysis queue -> `/analyze-rejection`) as three
+    separate processes. Setting `DLT_ENABLED=true` additionally spawns
+    `src/dlt_consumer.py` (dead-letter topic -> `/fetch-dlt-logs`) and
+-   `src/dlt_analysis_consumer.py` (DLT queue -> `/analyze-dlt`). See section
+-   3.11 for the fetch/analyze split and section 4.4 for the DLT lane.*
+-
+-   To run them individually:
++   `src/dlt_analysis_consumer.py` (DLT queue -> `/analyze-dlt`).
++   `REJECTION_ENABLED`, `FETCH_STAGE_ENABLED` and `ANALYSIS_STAGE_ENABLED`
++   (all default `true`) narrow that down, so one instance can fetch the logs
++   while others run each lane's analysis (section 3.11.1). See section 3.11
++   for the fetch/analyze split and section 4.4 for the DLT lane.*
++
++   To run them individually (a consumer run this way forwards to its API
++   ready or not, and a message it cannot forward goes to the DLQ; `start.py`
++   is what waits for the API first):
+    ```bash
+    python3 src/main_api.py             # API only
+    python3 src/fast_consumer.py        # Fast consumer only (rejections)
+diff --git a/src/utils/consumer_roles.py b/src/utils/consumer_roles.py
+new file mode 100644
+index 0000000..28362b7
+--- /dev/null
++++ b/src/utils/consumer_roles.py
+@@ -0,0 +1,156 @@
++"""Which Kafka consumers this instance runs.
++
++Both lanes split into the same two stages, and each stage of each lane is a
++consumer process of its own (ARCHITECTURE.md 3.11, 4.4):
++
++    lane        fetch stage                          analysis stage
++    rejection   fast_consumer.py -> /fetch-logs      slow_consumer.py -> /analyze-rejection
++    DLT         dlt_consumer.py -> /fetch-dlt-logs   dlt_analysis_consumer.py -> /analyze-dlt
++
++start.py runs the API beside whichever of them four switches select:
++
++    REJECTION_ENABLED       (true)   the rejection lane
++    DLT_ENABLED             (false)  the DLT lane
++    FETCH_STAGE_ENABLED     (true)   the fetch stage of each lane that is on
++    ANALYSIS_STAGE_ENABLED  (true)   the analysis stage of each lane that is on
++
++Left unset they start what start.py always started: the two rejection
++consumers, and the two DLT consumers as well under DLT_ENABLED=true. Set
++apart, they let one image run as separate deployments, each sized for its own
++work: one fetching both lanes' logs, one analysing rejections, one analysing
++dead letters.
++
++Only start.py reads them. A consumer takes its role from its own entry
++script, and the API serves every route whatever runs beside it.
++"""
++import os
++from typing import NamedTuple
++
++REJECTION = "rejection"
++DLT = "dlt"
++FETCH = "fetch"
++ANALYSIS = "analysis"
++
++#: Each lane's switch and its default. DLT_ENABLED keeps the default it has
++#: always had: a deployment with no dead-letter topic would otherwise start
++#: consumers that fail to subscribe, and the supervisor tears everything down
++#: when one exits (DLT_PLAN.md Phase 4).
++LANES = {
++    REJECTION: ("REJECTION_ENABLED", True),
++    DLT: ("DLT_ENABLED", False),
++}
++
++#: Each stage's switch and its default.
++STAGES = {
++    FETCH: ("FETCH_STAGE_ENABLED", True),
++    ANALYSIS: ("ANALYSIS_STAGE_ENABLED", True),
++}
++
++#: How a lane is named in what start.py prints.
++LANE_LABELS = {REJECTION: "rejection", DLT: "DLT"}
++
++_TRUE = ("true", "1", "yes")
++_FALSE = ("false", "0", "no")
++
++
++class Consumer(NamedTuple):
++    name: str     # the supervisor's name for the process
++    title: str    # how start.py announces it
++    role: str     # the CONSUMER_ROLE its entry script sets
++    lane: str
++    stage: str
++    script: str
++    flow: str     # what it reads -> where it forwards it
++
++
++#: Every consumer, in the order start.py starts them.
++CONSUMERS = (
++    Consumer("FastConsumer", "the fast consumer", "fast", REJECTION, FETCH,
++             "src/fast_consumer.py", "rejections -> /fetch-logs"),
++    Consumer("SlowConsumer", "the slow consumer", "slow", REJECTION, ANALYSIS,
++             "src/slow_consumer.py", "analysis queue -> /analyze-rejection"),
++    Consumer("DltConsumer", "the DLT consumer", "dlt", DLT, FETCH,
++             "src/dlt_consumer.py", "dead-letter topics -> /fetch-dlt-logs"),
++    Consumer("DltAnalysisConsumer", "the DLT analysis consumer", "dlt_analysis", DLT,
++             ANALYSIS, "src/dlt_analysis_consumer.py", "DLT queue -> /analyze-dlt"),
++)
++
++
++def _switch(variable: str, default: bool) -> bool:
++    """A switch's value; unset or blank is its default.
++
++    Anything that is neither true nor false is an error rather than a guess.
++    Read as off, a misspelt switch leaves a lane's packets unread; read as on,
++    it starts consumers that take a share of the partitions another instance
++    was deployed to read.
++    """
++    raw = os.environ.get(variable, "").strip()
++    if not raw:
++        return default
++    if raw.lower() in _TRUE:
++        return True
++    if raw.lower() in _FALSE:
++        return False
++    raise ValueError(f"{variable} must be true or false; got {raw!r}.")
++
++
++def lanes() -> tuple:
++    """The lanes switched on. Raises ValueError on a misspelt switch."""
++    return tuple(lane for lane, (variable, default) in LANES.items()
++                 if _switch(variable, default))
++
++
++def stages() -> tuple:
++    """The stages switched on. Raises ValueError on a misspelt switch."""
++    return tuple(stage for stage, (variable, default) in STAGES.items()
++                 if _switch(variable, default))
++
++
++def selected() -> tuple:
++    """The consumers to start here, in the order to start them."""
++    on_lanes, on_stages = lanes(), stages()
++    return tuple(consumer for consumer in CONSUMERS
++                 if consumer.lane in on_lanes and consumer.stage in on_stages)
++
++
++def validate() -> list:
++    """Configuration errors, for start.py to refuse to start on."""
++    errors = []
++    for variable, default in (*LANES.values(), *STAGES.values()):
++        try:
++            _switch(variable, default)
++        except ValueError as error:
++            errors.append(str(error))
++    if errors:
++        return errors
++
++    consumers = selected()
++    if not consumers:
++        return ["No Kafka consumer is switched on: REJECTION_ENABLED and DLT_ENABLED "
++                "choose the lanes and FETCH_STAGE_ENABLED and ANALYSIS_STAGE_ENABLED "
++                "their stages, and at least one of each must be true."]
++
++    # A lane run here at one stage only has its other stage on another
++    # instance, and the two hand every packet over through the casebook store:
++    # the fetch stage saves the logs, the status and the service that the
++    # analysis stage reads back. On local storage each instance sees only its
++    # own disk, so the analysis stage would find none of it -- and fetch the
++    # logs again itself, by when the pods may have rotated them away.
++    backend = os.environ.get("CASEBOOK_STORAGE_BACKEND", "local").strip().lower()
++    if backend == "s3":
++        return errors
++    for lane, label in LANE_LABELS.items():
++        lane_stages = [consumer.stage for consumer in consumers if consumer.lane == lane]
++        if lane_stages == [FETCH]:
++            errors.append(
++                f"The {label} lane's fetch stage runs here without its analysis "
++                f"stage, and the instance that analyses its packets reads the logs "
++                f"and status this one saves: that needs "
++                f"CASEBOOK_STORAGE_BACKEND=s3, not {backend!r}.")
++        elif lane_stages == [ANALYSIS]:
++            errors.append(
++                f"The {label} lane's analysis stage runs here without its fetch "
++                f"stage, and reads the logs and status saved by the instance that "
++                f"fetches its packets: that needs CASEBOOK_STORAGE_BACKEND=s3, "
++                f"not {backend!r}.")
++    return errors
+diff --git a/start.py b/start.py
+index 6a799c9..70c1e57 100644
+--- a/start.py
++++ b/start.py
+@@ -1,14 +1,23 @@
+ """Process supervisor for the Agentic Resident CRM ecosystem.
+ 
+-Spawns the API and both Kafka consumers -- fast_consumer.py (rejections ->
+-POST /fetch-logs) and slow_consumer.py (the analysis queue -> POST
+-/analyze-rejection) -- then holds all three open. If any exits, the rest are
+-terminated rather than left running half a system: a consumer with no API
+-forwards every packet into a connection error, and an API with no consumers
+-silently stops receiving work (F12). Each consumer sets its own CONSUMER_ROLE
+-before importing kafkaConsumer.py, so no special per-child environment is
+-needed here to keep their topics, heartbeat files, and health ports apart.
++Spawns the API and the Kafka consumers this instance runs, then holds them all
++open. Which consumers those are is up to four switches
++(src/utils/consumer_roles.py): REJECTION_ENABLED and DLT_ENABLED choose the
++lanes, FETCH_STAGE_ENABLED and ANALYSIS_STAGE_ENABLED the stages of each. Left
++unset, that is fast_consumer.py (rejections -> POST /fetch-logs) and
++slow_consumer.py (the analysis queue -> POST /analyze-rejection), plus
++dlt_consumer.py and dlt_analysis_consumer.py under DLT_ENABLED=true. Set
++apart, they let the same image run as separate deployments -- one fetching
++every lane's logs, others analysing each lane -- each sized for its own work.
++
++If any child exits, the rest are terminated rather than left running half a
++system: a consumer with no API forwards every packet into a connection error,
++and an API with no consumers silently stops receiving work (F12). Each
++consumer sets its own CONSUMER_ROLE before importing kafkaConsumer.py, so no
++special per-child environment is needed here to keep their topics, heartbeat
++files, and health ports apart.
+ """
++import http.client
+ import os
+ import signal
+ import subprocess
+@@ -16,6 +25,8 @@ import sys
+ import time
+ from dotenv import load_dotenv
+ 
++from src.utils import consumer_roles
++
+ load_dotenv()
+ 
+ # How long a child gets to shut down gracefully before SIGKILL. Must exceed
+@@ -55,68 +66,89 @@ def _handle_signal(signum, _frame):
+     sys.exit(0)
+ 
+ 
++def _http_get(path):
++    """GET /path on 127.0.0.1:8000. Returns (status_code, body) or (None, error).
++
++    Uses http.client directly instead of urllib to completely bypass
++    proxy env vars — on Windows, urllib's ProxyHandler({"http": None})
++    does not reliably bypass the corporate proxy for localhost.
++    """
++    try:
++        conn = http.client.HTTPConnection("127.0.0.1", 8000, timeout=2)
++        conn.request("GET", path)
++        resp = conn.getresponse()
++        body = resp.read().decode("utf-8", errors="replace")
++        code = resp.status
++        conn.close()
++        return code, body
++    except Exception as e:
++        return None, str(e)
++
++
+ def main():
+-    print("Starting the Agentic Resident CRM ecosystem.\n")
++    # Checked before anything starts: a misspelt switch, or a lane's stages
++    # split across instances that cannot share what one hands the other, is
++    # refused here rather than found packet by packet.
++    errors = consumer_roles.validate()
++    if errors:
++        for error in errors:
++            print(f"Startup validation error: {error}", file=sys.stderr)
++        sys.exit(1)
++    consumers = consumer_roles.selected()
++
++    print("Starting the Agentic Resident CRM ecosystem.")
++    lanes = ", ".join(consumer_roles.LANE_LABELS[lane] for lane in consumer_roles.lanes())
++    print(f"Lanes: {lanes}. Stages: {', '.join(consumer_roles.stages())}.\n")
+ 
+     for sig in (signal.SIGTERM, signal.SIGINT):
+         signal.signal(sig, _handle_signal)
+ 
+     print("Starting the API server (main_api.py).")
+-    _children.append(("API", subprocess.Popen([sys.executable, "src/main_api.py"])))
+-
+-    # Wait for the API to bind its port, then for its agent tool server (when
+-    # it runs one).
+-    #
+-    # Uses http.client directly instead of urllib to completely bypass
+-    # proxy env vars — on Windows, urllib's ProxyHandler({"http": None})
+-    # does not reliably bypass the corporate proxy for localhost.
+-    import http.client
++    api = subprocess.Popen([sys.executable, "src/main_api.py"])
++    _children.append(("API", api))
+ 
+-    def _http_get(path):
+-        """GET /path on 127.0.0.1:8000. Returns (status_code, body) or (None, error)."""
+-        try:
+-            conn = http.client.HTTPConnection("127.0.0.1", 8000, timeout=2)
+-            conn.request("GET", path)
+-            resp = conn.getresponse()
+-            body = resp.read().decode("utf-8", errors="replace")
+-            code = resp.status
+-            conn.close()
+-            return code, body
+-        except Exception as e:
+-            return None, str(e)
++    # Both waits below give up as soon as the API exits -- on a configuration
++    # error it refuses to boot on, say. The loop at the end then reports it and
++    # stops everything, and no consumer is started first only to forward
++    # packets into a connection error.
+ 
+     # Step 1: wait for the API to bind its port
+     api_ready = False
+     for _ in range(120):
++        if api.poll() is not None:
++            break
+         code, _ = _http_get("/health")
+         if code == 200:
+             api_ready = True
+             break
+         time.sleep(1)
+ 
+-    if not api_ready:
+-        print("WARNING: API did not bind within 120s; starting consumers anyway.")
+-    else:
++    if api_ready:
+         print("API server is listening.")
+-
+-    # Step 2: if the API runs its own agent tool server, wait for it. The
+-    # /ready endpoint returns 503 "Starting agent tool server" while the tool
+-    # server boots, 503 "Downloading ..." while the reason-code documentation
+-    # or service map is fetched, and 503 with other details for
+-    # Kafka/checkpoint issues (which we accept).
++    elif api.poll() is None:
++        print("WARNING: API did not bind within 120s; waiting for /ready.")
++
++    # Step 2: wait for the API to be ready for packets. /ready returns 503
++    # "Starting agent tool server" while the API's own tool server boots, 503
++    # "Downloading ..." until the first copy of the reason-code documentation
++    # or service map is on disk, and 503 with other details for
++    # Kafka/checkpoint issues (which we accept -- the consumers handle those).
+     #
+-    # Whether the server is coming up at all is resolved by mcp_config, not
+-    # re-derived here: the switch then has exactly one reader, so the
+-    # supervisor can never disagree with the API about it. `load_dotenv()`
+-    # already ran at module import.
+-    from src.tools.mcp_config import serve_locally as tools_served_locally
+-    if tools_served_locally():
+-        print("Waiting for the agent tool server...")
+-        tools_ready = False
++    # Asked whatever this instance runs. It used to be asked only when the API
++    # served its own tools, so an instance without them -- a fetch-only one,
++    # say -- started forwarding before the service map arrived, and the fetch
++    # stage saves the service it resolves for the analysis stage to reuse.
++    # Whether either is coming up at all is the API's to say, through /ready,
++    # so the supervisor can never disagree with it.
++    if api.poll() is None:
++        print("Waiting for the API to be ready...")
++        services_ready = False
+         for i in range(300):
++            if api.poll() is not None:
++                break
+             code, body = _http_get("/ready")
+             if code == 200:
+-                tools_ready = True
++                services_ready = True
+                 print("API ready (tools and services).")
+                 break
+             if code == 503:
+@@ -124,42 +156,28 @@ def main():
+                 # ready. Any other 503 (Kafka, checkpoint) is fine --
+                 # consumers handle it.
+                 if "Downloading" not in body and "Starting agent tool server" not in body:
+-                    tools_ready = True
+-                    print("Tools ready; starting consumers.")
++                    services_ready = True
++                    print("Tools and downloads ready; starting consumers.")
+                     break
+             if i % 15 == 0:
+                 print(f"  ...still waiting ({i*2}s). /ready: {code} {body[:80] if body else ''}")
+             time.sleep(2)
+ 
+-        if not tools_ready:
+-            print("WARNING: The agent tool server did not become ready within "
+-                  "600s; starting consumers anyway.")
+-
+-    print("Starting the fast consumer (fast_consumer.py) -- rejections -> /fetch-logs.")
+-    _children.append(("FastConsumer", subprocess.Popen([sys.executable, "src/fast_consumer.py"])))
+-
+-    print("Starting the slow consumer (slow_consumer.py) -- analysis queue -> /analyze-rejection.")
+-    _children.append(("SlowConsumer", subprocess.Popen([sys.executable, "src/slow_consumer.py"])))
+-
+-    # Off by default: a deployment with no dead-letter topic configured would
+-    # otherwise start two consumers that fail to subscribe, and the supervisor
+-    # would tear down the whole ecosystem when they exited (DLT_PLAN.md
+-    # Phase 4).
+-    if os.environ.get("DLT_ENABLED", "false").strip().lower() in ("true", "1", "yes"):
+-        print("Starting the DLT consumer (dlt_consumer.py) -- dead-letter topic -> /fetch-dlt-logs.")
+-        _children.append(("DltConsumer", subprocess.Popen([sys.executable, "src/dlt_consumer.py"])))
+-
+-        dlt_analysis = "src/dlt_analysis_consumer.py"
+-        if os.path.exists(dlt_analysis):
+-            print("Starting the DLT analysis consumer -- DLT queue -> /analyze-dlt.")
+-            _children.append(("DltAnalysisConsumer",
+-                              subprocess.Popen([sys.executable, dlt_analysis])))
++        if not services_ready and api.poll() is None:
++            print("WARNING: The API did not become ready within 600s; "
++                  "starting consumers anyway.")
+ 
+-    print(f"\nAll {len(_children)} services are running. Press Ctrl+C to stop them.")
++    if api.poll() is None:
++        for consumer in consumers:
++            print(f"Starting {consumer.title} ({os.path.basename(consumer.script)}) "
++                  f"-- {consumer.flow}.")
++            _children.append((consumer.name,
++                              subprocess.Popen([sys.executable, consumer.script])))
++        print(f"\nAll {len(_children)} services are running. Press Ctrl+C to stop them.")
+ 
+     try:
+-        # Wait on all three concurrently. Waiting on the API and only then on
+-        # the consumer(s) would let an API crash leave the consumers running
++        # Wait on all of them concurrently. Waiting on the API and only then
++        # on the consumers would let an API crash leave the consumers running
+         # unattended while the supervisor sat blocked.
+         while True:
+             for name, process in _children:
+diff --git a/tests/conftest.py b/tests/conftest.py
+index ce14516..953b2c3 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -86,7 +86,11 @@ ISOLATED_ENV_VARS = (
+     "ENABLE_LOG_FETCHING",
+     "ENABLE_LOG_FILTER_AGENT",
+     "ENABLE_AUTO_REPLAY",
++    # Which consumers start.py starts (src/utils/consumer_roles.py).
++    "REJECTION_ENABLED",
+     "DLT_ENABLED",
++    "FETCH_STAGE_ENABLED",
++    "ANALYSIS_STAGE_ENABLED",
+     "DLT_AUTO_REPLAY_ENABLED",
+     "DLT_REUSE_ENABLED",
+     "DLT_REGISTRY_PATH",
+diff --git a/tests/test_consumer_roles.py b/tests/test_consumer_roles.py
+new file mode 100644
+index 0000000..e4a0983
+--- /dev/null
++++ b/tests/test_consumer_roles.py
+@@ -0,0 +1,378 @@
++"""Which consumers start.py starts (src/utils/consumer_roles.py).
++
++REJECTION_ENABLED and DLT_ENABLED choose the lanes, FETCH_STAGE_ENABLED and
++ANALYSIS_STAGE_ENABLED the stages of each, so one image can run as separate
++deployments: one fetching both lanes' logs, one analysing rejections, one
++analysing dead letters. Unset, they must start exactly what start.py always
++did.
++
++The supervisor tests drive the real `start.main()` with only its child
++processes and its HTTP probes faked, so they check what is actually started,
++in what order, and what is refused before anything starts.
++"""
++import itertools
++import signal
++import subprocess
++import time
++from pathlib import Path
++from types import SimpleNamespace
++
++import pytest
++
++from src.utils import consumer_roles
++
++REPO = Path(__file__).resolve().parents[1]
++
++SWITCHES = ("REJECTION_ENABLED", "DLT_ENABLED", "FETCH_STAGE_ENABLED",
++            "ANALYSIS_STAGE_ENABLED")
++
++#: Each consumer's script, the CONSUMER_ROLE it sets, and the lane and stage
++#: switches that must both be on for it to start -- written out here rather
++#: than read from the module, so the module's own table is checked too. In
++#: the order start.py has always started them.
++EXPECTED = {
++    "src/fast_consumer.py": ("fast", "REJECTION_ENABLED", "FETCH_STAGE_ENABLED"),
++    "src/slow_consumer.py": ("slow", "REJECTION_ENABLED", "ANALYSIS_STAGE_ENABLED"),
++    "src/dlt_consumer.py": ("dlt", "DLT_ENABLED", "FETCH_STAGE_ENABLED"),
++    "src/dlt_analysis_consumer.py": ("dlt_analysis", "DLT_ENABLED",
++                                     "ANALYSIS_STAGE_ENABLED"),
++}
++
++#: The three deployments the switches exist for.
++FETCH_INSTANCE = {"REJECTION_ENABLED": "true", "DLT_ENABLED": "true",
++                  "FETCH_STAGE_ENABLED": "true", "ANALYSIS_STAGE_ENABLED": "false"}
++REJECTION_ANALYSIS_INSTANCE = {"REJECTION_ENABLED": "true", "DLT_ENABLED": "false",
++                               "FETCH_STAGE_ENABLED": "false",
++                               "ANALYSIS_STAGE_ENABLED": "true"}
++DLT_ANALYSIS_INSTANCE = {"REJECTION_ENABLED": "false", "DLT_ENABLED": "true",
++                         "FETCH_STAGE_ENABLED": "false", "ANALYSIS_STAGE_ENABLED": "true"}
++
++LAYOUTS = [
++    (FETCH_INSTANCE, ["src/fast_consumer.py", "src/dlt_consumer.py"]),
++    (REJECTION_ANALYSIS_INSTANCE, ["src/slow_consumer.py"]),
++    (DLT_ANALYSIS_INSTANCE, ["src/dlt_analysis_consumer.py"]),
++]
++LAYOUT_IDS = ["fetch", "rejection-analysis", "dlt-analysis"]
++
++
++def _set(monkeypatch, settings, storage="s3"):
++    for name, value in settings.items():
++        monkeypatch.setenv(name, value)
++    monkeypatch.setenv("CASEBOOK_STORAGE_BACKEND", storage)
++
++
++def _scripts():
++    return [consumer.script for consumer in consumer_roles.selected()]
++
++
++# ======================================================================
++# Which consumers are selected
++# ======================================================================
++
++def test_unset_switches_start_what_start_py_always_started():
++    assert _scripts() == ["src/fast_consumer.py", "src/slow_consumer.py"]
++    assert consumer_roles.validate() == []
++
++
++def test_dlt_enabled_still_adds_both_dlt_consumers(monkeypatch):
++    monkeypatch.setenv("DLT_ENABLED", "true")
++    assert _scripts() == list(EXPECTED)
++
++
++@pytest.mark.parametrize(
++    "values", list(itertools.product((True, False), repeat=len(SWITCHES))),
++    ids=lambda values: "-".join("on" if value else "off" for value in values))
++def test_a_consumer_starts_exactly_when_its_lane_and_its_stage_are_on(monkeypatch, values):
++    settings = dict(zip(SWITCHES, values))
++    for name, on in settings.items():
++        monkeypatch.setenv(name, "true" if on else "false")
++    assert _scripts() == [script for script, (_, lane, stage) in EXPECTED.items()
++                          if settings[lane] and settings[stage]]
++
++
++@pytest.mark.parametrize("settings, scripts", LAYOUTS, ids=LAYOUT_IDS)
++def test_the_three_instance_layout(monkeypatch, settings, scripts):
++    _set(monkeypatch, settings)
++    assert consumer_roles.validate() == []
++    assert _scripts() == scripts
++
++
++def test_the_three_instances_together_run_every_consumer_once(monkeypatch):
++    """No consumer is left out, and none runs on two kinds of instance -- where
++    both would share its partitions, whatever each was deployed to do."""
++    started = []
++    for settings, _ in LAYOUTS:
++        _set(monkeypatch, settings)
++        started.extend(_scripts())
++    assert sorted(started) == sorted(EXPECTED)
++
++
++@pytest.mark.parametrize("consumer", consumer_roles.CONSUMERS, ids=lambda c: c.name)
++def test_each_consumer_is_the_script_that_plays_its_role(consumer):
++    """A consumer's lane and stage are only as good as the script it names:
++    the role that script sets is what picks its topic and its route."""
++    role, lane_switch, stage_switch = EXPECTED[consumer.script]
++    assert consumer.role == role
++    assert consumer_roles.LANES[consumer.lane][0] == lane_switch
++    assert consumer_roles.STAGES[consumer.stage][0] == stage_switch
++    source = (REPO / consumer.script).read_text(encoding="utf-8")
++    assert f'os.environ["CONSUMER_ROLE"] = "{role}"' in source
++
++
++# ======================================================================
++# Reading the switches
++# ======================================================================
++
++@pytest.mark.parametrize("raw, on", [
++    ("true", True), ("TRUE", True), (" yes ", True), ("1", True),
++    ("false", False), ("False", False), ("no", False), ("0", False),
++])
++def test_switch_spellings(monkeypatch, raw, on):
++    monkeypatch.setenv("DLT_ENABLED", raw)
++    assert (consumer_roles.DLT in consumer_roles.lanes()) is on
++
++
++def test_a_blank_switch_is_its_default(monkeypatch):
++    for name in SWITCHES:
++        monkeypatch.setenv(name, "  ")
++    assert _scripts() == ["src/fast_consumer.py", "src/slow_consumer.py"]
++    assert consumer_roles.validate() == []
++
++
++def test_a_misspelt_switch_is_refused_rather_than_guessed(monkeypatch):
++    monkeypatch.setenv("REJECTION_ENABLED", "ture")
++    assert consumer_roles.validate() == [
++        "REJECTION_ENABLED must be true or false; got 'ture'."]
++    with pytest.raises(ValueError):
++        consumer_roles.selected()
++
++
++def test_every_misspelt_switch_is_reported_at_once(monkeypatch):
++    monkeypatch.setenv("DLT_ENABLED", "enabled")
++    monkeypatch.setenv("FETCH_STAGE_ENABLED", "off")
++    assert consumer_roles.validate() == [
++        "DLT_ENABLED must be true or false; got 'enabled'.",
++        "FETCH_STAGE_ENABLED must be true or false; got 'off'.",
++    ]
++
++
++# ======================================================================
++# Configurations refused
++# ======================================================================
++
++@pytest.mark.parametrize("settings", [
++    # The likeliest slip: a DLT analysis instance that turns the rejection
++    # lane off and forgets that DLT_ENABLED is off by default.
++    {"REJECTION_ENABLED": "false", "FETCH_STAGE_ENABLED": "false"},
++    {"REJECTION_ENABLED": "false", "DLT_ENABLED": "false"},
++    {"FETCH_STAGE_ENABLED": "false", "ANALYSIS_STAGE_ENABLED": "false"},
++    {"DLT_ENABLED": "true", "FETCH_STAGE_ENABLED": "false",
++     "ANALYSIS_STAGE_ENABLED": "false"},
++], ids=["dlt-left-at-default", "no-lane", "no-stage", "lanes-but-no-stage"])
++def test_an_instance_that_would_run_no_consumer_is_refused(monkeypatch, settings):
++    _set(monkeypatch, settings)
++    errors = consumer_roles.validate()
++    assert len(errors) == 1
++    assert errors[0].startswith("No Kafka consumer is switched on")
++
++
++@pytest.mark.parametrize("settings, lanes", [
++    (FETCH_INSTANCE, ["The rejection lane's fetch stage", "The DLT lane's fetch stage"]),
++    (REJECTION_ANALYSIS_INSTANCE, ["The rejection lane's analysis stage"]),
++    (DLT_ANALYSIS_INSTANCE, ["The DLT lane's analysis stage"]),
++], ids=LAYOUT_IDS)
++def test_a_lane_split_across_instances_needs_s3(monkeypatch, settings, lanes):
++    """The analysis instance reads what the fetch instance saved, and on local
++    storage each instance has only its own disk."""
++    _set(monkeypatch, settings, storage="local")
++    errors = consumer_roles.validate()
++    assert [error.split(" runs here")[0] for error in errors] == lanes
++    assert all(error.endswith("needs CASEBOOK_STORAGE_BACKEND=s3, not 'local'.")
++               for error in errors)
++
++
++def test_a_split_lane_is_refused_on_any_backend_but_s3(monkeypatch):
++    _set(monkeypatch, REJECTION_ANALYSIS_INSTANCE, storage="minio")
++    assert consumer_roles.validate()[0].endswith("not 'minio'.")
++
++
++@pytest.mark.parametrize("settings", [
++    {},
++    {"DLT_ENABLED": "true"},
++    {"REJECTION_ENABLED": "false", "DLT_ENABLED": "true"},
++], ids=["default", "both-lanes", "dlt-lane-alone"])
++def test_a_lane_whose_stages_both_run_here_needs_no_shared_storage(monkeypatch, settings):
++    """Nothing passes between the two lanes, so only a lane split by stage
++    needs S3."""
++    _set(monkeypatch, settings, storage="local")
++    assert consumer_roles.validate() == []
++
++
++def test_env_example_lists_every_switch_at_its_default():
++    lines = set((REPO / ".env.example").read_text(encoding="utf-8").splitlines())
++    for variable, default in (*consumer_roles.LANES.values(),
++                              *consumer_roles.STAGES.values()):
++        assert f"{variable}={'true' if default else 'false'}" in lines
++
++
++# ======================================================================
++# start.py
++# ======================================================================
++
++class _Child:
++    """A child process that runs until it is stopped, or made to exit."""
++
++    def __init__(self, args):
++        self.script = args[1]
++        self.returncode = None
++        self.terminated = False
++
++    def poll(self):
++        return self.returncode
++
++    def terminate(self):
++        self.terminated = True
++        self.returncode = -15
++
++    def kill(self):
++        self.returncode = -9
++
++    def wait(self, timeout=None):
++        return self.returncode
++
++
++API_EXITS = "api exits"
++
++
++@pytest.fixture
++def supervisor(monkeypatch):
++    """Run `start.main()` to the end; returns what it did.
++
++    `ready` is what /ready answers, in turn, the last answer repeating; the
++    marker API_EXITS makes the API exit at that probe instead. Once anything
++    beyond the API is running, the next sleep -- the loop watching the
++    children -- makes the `exits` child exit with its code, which ends the run.
++    """
++    import start
++
++    def run_supervisor(ready=((200, '{"status":"ready"}'),), api_exit=None,
++                       exits=("src/main_api.py", 0)):
++        run = SimpleNamespace(events=[], children=[], sleeps=0, code=None)
++        answers = list(ready)
++
++        def popen(args):
++            child = _Child(args)
++            if not run.children:
++                child.returncode = api_exit
++            run.children.append(child)
++            run.events.append(child.script)
++            return child
++
++        def http_get(path):
++            run.events.append(f"GET {path}")
++            if path != "/ready":
++                return 200, '{"status":"up"}'
++            answer = answers.pop(0) if len(answers) > 1 else answers[0]
++            if answer == API_EXITS:
++                run.children[0].returncode = 2
++                return None, "Connection refused"
++            return answer
++
++        def sleep(_seconds):
++            run.sleeps += 1
++            assert run.sleeps < 1000, "the supervisor never stopped"
++            if len(run.children) > 1:
++                script, code = exits
++                next(c for c in run.children if c.script == script).returncode = code
++
++        monkeypatch.setattr(start, "subprocess", SimpleNamespace(
++            Popen=popen, TimeoutExpired=subprocess.TimeoutExpired))
++        monkeypatch.setattr(start, "time", SimpleNamespace(
++            sleep=sleep, monotonic=time.monotonic))
++        monkeypatch.setattr(start, "signal", SimpleNamespace(
++            signal=lambda *args: None, SIGTERM=signal.SIGTERM, SIGINT=signal.SIGINT))
++        monkeypatch.setattr(start, "_http_get", http_get)
++        monkeypatch.setattr(start, "_children", [])
++        monkeypatch.setattr(start, "_stopping", False)
++
++        with pytest.raises(SystemExit) as stopped:
++            start.main()
++        run.code = stopped.value.code
++        run.started = [event for event in run.events if not event.startswith("GET ")]
++        return run
++
++    return run_supervisor
++
++
++def test_the_supervisor_starts_what_it_always_started(supervisor):
++    run = supervisor()
++    assert run.started == ["src/main_api.py", "src/fast_consumer.py",
++                           "src/slow_consumer.py"]
++    assert run.code == 0
++
++
++@pytest.mark.parametrize("settings, scripts", [
++    *LAYOUTS, ({"DLT_ENABLED": "true"}, list(EXPECTED)),
++], ids=[*LAYOUT_IDS, "everything"])
++def test_the_supervisor_starts_only_the_selected_consumers(monkeypatch, supervisor,
++                                                           settings, scripts):
++    _set(monkeypatch, settings)
++    assert supervisor().started == ["src/main_api.py", *scripts]
++
++
++@pytest.mark.parametrize("settings, storage, message", [
++    ({"REJECTION_ENABLED": "nope"}, "s3", "REJECTION_ENABLED must be true or false"),
++    ({"REJECTION_ENABLED": "false"}, "s3", "No Kafka consumer is switched on"),
++    (FETCH_INSTANCE, "local", "The rejection lane's fetch stage runs here"),
++], ids=["misspelt", "no-consumer", "split-on-local"])
++def test_the_supervisor_refuses_before_starting_anything(monkeypatch, capsys, supervisor,
++                                                         settings, storage, message):
++    _set(monkeypatch, settings, storage=storage)
++    run = supervisor()
++    assert run.code == 1
++    assert run.events == []
++    assert f"Startup validation error: {message}" in capsys.readouterr().err
++
++
++def test_the_supervisor_waits_for_the_downloads_without_a_tool_server_of_its_own(
++        monkeypatch, supervisor):
++    """It waited on /ready only when the API served its own tools, so an
++    instance without them -- a fetch instance with AGENT_MCP_SERVE=false --
++    forwarded packets before the service map had arrived, and the fetch stage
++    saves the service it resolves for the analysis stage to reuse."""
++    _set(monkeypatch, FETCH_INSTANCE)
++    monkeypatch.setenv("AGENT_MCP_SERVE", "false")
++    downloading = (503, '{"detail":"Downloading reason-code service map"}')
++    run = supervisor(ready=[downloading, downloading, (200, '{"status":"ready"}')])
++    assert run.events == ["src/main_api.py", "GET /health",
++                          "GET /ready", "GET /ready", "GET /ready",
++                          "src/fast_consumer.py", "src/dlt_consumer.py"]
++
++
++def test_the_supervisor_still_starts_the_consumers_on_a_kafka_503(supervisor):
++    run = supervisor(ready=[(503, '{"detail":"Service Unavailable"}')])
++    assert run.started == ["src/main_api.py", "src/fast_consumer.py",
++                           "src/slow_consumer.py"]
++
++
++def test_an_api_that_exits_at_once_starts_no_consumer(supervisor):
++    """Not probed for two minutes, then given consumers to forward into a
++    connection error until the loop noticed."""
++    run = supervisor(api_exit=1)
++    assert run.events == ["src/main_api.py"]
++    assert run.code == 1
++
++
++def test_an_api_that_exits_while_downloading_starts_no_consumer(supervisor):
++    downloading = (503, '{"detail":"Downloading reason-code documentation"}')
++    run = supervisor(ready=[downloading, API_EXITS])
++    assert run.started == ["src/main_api.py"]
++    assert run.events.count("GET /ready") == 2
++    assert run.code == 2
++
++
++def test_a_consumer_that_exits_stops_everything_else(supervisor):
++    run = supervisor(exits=("src/slow_consumer.py", 3))
++    assert run.code == 3
++    api, fast, slow = run.children
++    assert api.terminated and fast.terminated and not slow.terminated
