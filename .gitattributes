@@ -1,0 +1,4 @@
+# Keep patch/diff files byte-for-byte (no line-ending conversion),
+# so they apply cleanly after cloning on any OS, including Windows.
+*.patch -text
+*.diff  -text
