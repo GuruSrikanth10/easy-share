@@ -1,0 +1,551 @@
+diff --git a/src/prompts/InvestigatorAgent.md b/src/prompts/InvestigatorAgent.md
+index 39da687..a2d3722 100644
+--- a/src/prompts/InvestigatorAgent.md
++++ b/src/prompts/InvestigatorAgent.md
+@@ -142,5 +142,26 @@ Because logs are fetched from highly concurrent microservices using a sliding wi
+ You MUST verify that any ERROR or failure you attribute to the current packet actually belongs to it. 
+ If an ERROR line explicitly mentions a `refId`, `eventId`, or `uid` that does NOT match the Kafka payload you were provided, you MUST completely ignore it. It is noise from a concurrent request.
+ 
++### KEY FACTS -- END YOUR FINDINGS WITH THIS LIST
++
++The Synthesis Agent writes the casebook from your findings alone: a fact you
++leave out of them never reaches it. End your findings with a section headed
++`KEY FACTS` that lists every packet-specific fact the evidence gives about the
++decision, one fact per line:
++
++- the rule, check or module that rejected the packet, as the logs name it;
++- every identifier the decision involved -- each candidate or matched record,
++  the parent or master record it belongs to, and their EIDs and UIDs --
++  written in full, exactly as logged, never shortened to its first characters;
++- each classification, match result, score, threshold, count and flag recorded
++  for this packet, with its exact value.
++
++After each fact, quote the log line it comes from, or name the tool that
++returned it; quote a line once when it gives several facts. Take these facts
++only from this packet's own lines and tool results, never from a `[context]`
++line or another packet's line. On one last line, `Not in the logs: ...`, name
++the facts the SERVICE CONTEXT asks for that the evidence does not show,
++instead of leaving them out or guessing them.
++
+ Determine exactly why the packet failed validation or execution.
+ Pass your detailed technical findings and DB rule analysis to the ReviewerAgent.
+diff --git a/src/prompts/SynthesisAgent.md b/src/prompts/SynthesisAgent.md
+index 313d408..d254031 100644
+--- a/src/prompts/SynthesisAgent.md
++++ b/src/prompts/SynthesisAgent.md
+@@ -12,7 +12,9 @@ If a SERVICE DOCUMENTATION TOOLS section is present, you may use those tools to
+ check a term or a resolution the approved investigation relies on. The
+ approved investigation stays the basis of your answer: add no cause it does
+ not contain, and never take a value from the documentation as one of this
+-packet's.
++packet's. If the section says instead that the documentation could not be
++reached, say so in one short sentence at the end of `rejection_description`,
++such as "The service documentation could not be consulted.", and nowhere else.
+ 
+ ### Resolution guidance from the reason code documentation
+ 
+@@ -27,17 +29,48 @@ did not apply. When the section is absent, choose as you otherwise would.
+ 
+ **CRITICAL INSTRUCTION FOR REPLAYS**: If you determine the final `Action` should be `REPLAY` (or `QC_REPLAY`), you MUST first call the `queue_for_replay` tool to stage the packet for the OIS pipeline. Take every parameter from the payload you were given -- `id` is the eventId. Only after the tool returns success should you output your final JSON.
+ 
+-Never invent a parameter value. If a value is not present in the payload, do not guess it and do not copy one out of a log line. Resident contact details in particular are resolved downstream from `id`; supplying an address you inferred would notify the wrong person about someone else's enrolment.
++Never invent a `queue_for_replay` parameter value. If a value is not present in the payload, do not guess it and do not copy one out of a log line. Resident contact details in particular are resolved downstream from `id`; supplying an address you inferred would notify the wrong person about someone else's enrolment.
+ 
+ When generating the synthesis, you MUST output your final findings strictly in the following JSON format without any surrounding text or markdown formatting:
+ {
+-  "rejection_description": "<detailed explanation of why the rejection occurred>",
+-  "synthesis": "<what did the resident intend to do, when and where did the packet fail or deviate from the intended result, and the resolution. MAXIMUM 2 to 3 sentences. Be extremely concise.>",
++  "rejection_description": "<the technical record of the rejection: the rule that rejected the packet, how this packet met it, and every packet-specific fact behind it, written as set out below>",
++  "synthesis": "<what the resident tried to do, where and why the packet failed, and the resolution, in simple English. MAXIMUM 3 sentences. It may give key details, but no personal data, as set out below.>",
+   "action": "<must be one of: REPLAY, WHITELISTING, QC_REPLAY, RO_APPROVAL, RESIDENT_PACKET_RESUBMIT, MANUAL_REVIEW>",
+   "resident_action": "<must be one of: NEW_PACKET, NEW_PACKET_WITH_DIFFERENT_ARTIFACTS, RO_APPLICATION, PENDING>",
+   "confidence": <number between 0.0 and 1.0>
+ }
+ 
++### Writing `rejection_description`
++It is the technical record of the rejection for the operators who check the
++decision: the logic, and every fact behind it. Write it from the approved
++investigation, in this order:
++
++1. The rule, check or module that rejected the packet, and what it requires.
++2. How this packet met it: each condition, with the value that decided it.
++3. Every packet-specific fact the investigation reports, including each line
++   of its KEY FACTS list: every identifier involved -- each candidate or
++   matched record, the parent or master record it belongs to, and their EIDs
++   and UIDs -- and each classification, match result, score, threshold, count
++   and flag, with its value.
++
++Copy every identifier and value exactly as the investigation gives it, in
++full; mask or withhold none of them. Never shorten an identifier to its first
++characters, round a score, or replace a list with "several" or "one or more".
++When several records are involved, name each one with its own values. Leave
++out any fact the investigation reports as not in the logs.
++
++Leave out what does not explain the decision: timestamps (unless a condition
++depends on one), pod and topic names, what the service published or logged
++after the decision, and how complete the logs were.
++
++### Writing `synthesis`
++It is the summary of the case in simple English, at most 3 sentences: what
++the resident tried to do, where and why the packet failed, and the resolution
++the SERVICE POLICY gives for this case, without alternatives it does not give.
++It may give the details that matter, such as what matched and the deciding
++values, but no personal data: leave out EIDs, UIDs, VIDs, names, dates of
++birth, contact details and addresses.
++
+ ### Output contract (enforced)
+ This response is machine-validated. `action` and `resident_action` must be
+ exactly one of the listed values -- not a near-miss like "REPLAY_PACKET" or a
+@@ -56,7 +89,7 @@ fluent your explanation is.
+   from the reason code alone.
+ 
+ If the trace begins with an `EVIDENCE GAPS` banner, part of the window was
+-unreadable. Say so in `rejection_description` and keep `confidence` at or
++unreadable. Leave that out of `rejection_description`, but keep `confidence` at or
+ below 0.6 -- a high confidence drawn from a trace you were told is incomplete
+ is unsupported by construction, and the system will cap it anyway.
+ 
+diff --git a/src/service_packs/enu-biometric/investigator.md b/src/service_packs/enu-biometric/investigator.md
+index a3aa8df..13d39c1 100644
+--- a/src/service_packs/enu-biometric/investigator.md
++++ b/src/service_packs/enu-biometric/investigator.md
+@@ -15,4 +15,14 @@ Strictly adhere to these core policies:
+ - `DemoTD` = face matched **and** all nonDemo matched: a complete biometric match across every modality, not a face-only match.
+ 
+ ### Packet-specific facts to look for
+-For this service, the packet-specific facts in the logs and tool results are, for example, which candidates matched, whether they share this packet's parent, which modality matched, the scores, and when.
++For this service, the packet-specific facts in the logs and tool results are which candidates matched, whether they share this packet's parent, which modality matched, the scores, and when. Your KEY FACTS list must give each of the following that the evidence shows, under the names the service logs it with:
++- **The decision**: the policy batch that rejected the applicant (`Applicant got rejected by : <module>`), `Applicant rejected by Mdd for Non TD`, the action the applicant was filtered on (`Filtering Applicant based on action: <action>`), and a rule's `Final result for all candidates`.
++- **Each candidate**: its `candidateRefId` and the `masterRefId` set for it; its `packetType` and `packetStatus`; `isFalsePositive` and `isCannotDetermine`, and whether it was marked TD from False Positive or Cannot Determine; whether it is whitelisted; and whether it was filtered out, and why (ignored, rejected, Aadhaar cancelled, or the UID matches the applicant's).
++- **Match results**: `mandatoryMatched`, `nonMandatoryMatchCount` and `requiredThreshold` for each candidate, and the age threshold, match threshold and mandatory modalities the rule used.
++- **Scores**: for each candidate, `MinScore`, `MaxScore`, `GapScore`, `LowCount` and `Final Risk Score`.
++- **EIDs and UIDs**: every EID and UID the decision's lines show, exactly as logged, with the candidate each belongs to when the lines show that.
++- **Counts**: the candidates returned and purged, the distinct candidates, `TD candidates`, `Anomalous candidates`, `TD EIDs`, `Anomalous EIDs`, and the candidates with and without Aadhaar.
++- **The applicant**: `isUpdateCase`, `applicantUidPresent`, whether it is a first-time biometric update, and whether it is whitelisted.
++
++### Log lines that are not failures
++- `Error while converting object to json string: Topic cannot be null.` is logged at ERROR level but is not an error. Never report it as a failure or as the cause of the rejection.
+diff --git a/src/service_packs/enu-biometric/synthesis.md b/src/service_packs/enu-biometric/synthesis.md
+index 8853b5a..33f5d83 100644
+--- a/src/service_packs/enu-biometric/synthesis.md
++++ b/src/service_packs/enu-biometric/synthesis.md
+@@ -12,3 +12,8 @@ Strictly adhere to these core policies:
+ 3. **MANDATORY BIOMETRIC UPDATE (MBU)**: Treated as Enrolment (1:N). Applies when parent Aadhaar has no prior biometrics. Undergoes full 1:N deduplication.
+ 
+ Translate raw rule conditions, such as `isApplicantWhiteListed: false`, with the SERVICE POLICY's "How to Interpret Rejections" section.
++
++### `rejection_description` for this service
++- Name the policy batch or module that rejected the applicant, and the action or rule condition it rejected on.
++- Then take each candidate the decision involved, in turn: its refId and its parent (`masterRefId`) in full, its EID and UID where the investigation gives them, whether that parent is the applicant's own, its classification (TD, anomalous, FP or Cannot Determine), and its match results and scores against the thresholds the rule used.
++- Give the counts the decision rested on, such as the TD and anomalous candidates and EIDs.
+\ No newline at end of file
+diff --git a/tests/fixtures/composed_prompts/_default/investigator.md b/tests/fixtures/composed_prompts/_default/investigator.md
+index 139e563..371c2a4 100644
+--- a/tests/fixtures/composed_prompts/_default/investigator.md
++++ b/tests/fixtures/composed_prompts/_default/investigator.md
+@@ -142,6 +142,27 @@ Because logs are fetched from highly concurrent microservices using a sliding wi
+ You MUST verify that any ERROR or failure you attribute to the current packet actually belongs to it. 
+ If an ERROR line explicitly mentions a `refId`, `eventId`, or `uid` that does NOT match the Kafka payload you were provided, you MUST completely ignore it. It is noise from a concurrent request.
+ 
++### KEY FACTS -- END YOUR FINDINGS WITH THIS LIST
++
++The Synthesis Agent writes the casebook from your findings alone: a fact you
++leave out of them never reaches it. End your findings with a section headed
++`KEY FACTS` that lists every packet-specific fact the evidence gives about the
++decision, one fact per line:
++
++- the rule, check or module that rejected the packet, as the logs name it;
++- every identifier the decision involved -- each candidate or matched record,
++  the parent or master record it belongs to, and their EIDs and UIDs --
++  written in full, exactly as logged, never shortened to its first characters;
++- each classification, match result, score, threshold, count and flag recorded
++  for this packet, with its exact value.
++
++After each fact, quote the log line it comes from, or name the tool that
++returned it; quote a line once when it gives several facts. Take these facts
++only from this packet's own lines and tool results, never from a `[context]`
++line or another packet's line. On one last line, `Not in the logs: ...`, name
++the facts the SERVICE CONTEXT asks for that the evidence does not show,
++instead of leaving them out or guessing them.
++
+ Determine exactly why the packet failed validation or execution.
+ Pass your detailed technical findings and DB rule analysis to the ReviewerAgent.
+ 
+diff --git a/tests/fixtures/composed_prompts/_default/synthesis.md b/tests/fixtures/composed_prompts/_default/synthesis.md
+index d4474c8..ee42f0c 100644
+--- a/tests/fixtures/composed_prompts/_default/synthesis.md
++++ b/tests/fixtures/composed_prompts/_default/synthesis.md
+@@ -12,7 +12,9 @@ If a SERVICE DOCUMENTATION TOOLS section is present, you may use those tools to
+ check a term or a resolution the approved investigation relies on. The
+ approved investigation stays the basis of your answer: add no cause it does
+ not contain, and never take a value from the documentation as one of this
+-packet's.
++packet's. If the section says instead that the documentation could not be
++reached, say so in one short sentence at the end of `rejection_description`,
++such as "The service documentation could not be consulted.", and nowhere else.
+ 
+ ### Resolution guidance from the reason code documentation
+ 
+@@ -27,17 +29,48 @@ did not apply. When the section is absent, choose as you otherwise would.
+ 
+ **CRITICAL INSTRUCTION FOR REPLAYS**: If you determine the final `Action` should be `REPLAY` (or `QC_REPLAY`), you MUST first call the `queue_for_replay` tool to stage the packet for the OIS pipeline. Take every parameter from the payload you were given -- `id` is the eventId. Only after the tool returns success should you output your final JSON.
+ 
+-Never invent a parameter value. If a value is not present in the payload, do not guess it and do not copy one out of a log line. Resident contact details in particular are resolved downstream from `id`; supplying an address you inferred would notify the wrong person about someone else's enrolment.
++Never invent a `queue_for_replay` parameter value. If a value is not present in the payload, do not guess it and do not copy one out of a log line. Resident contact details in particular are resolved downstream from `id`; supplying an address you inferred would notify the wrong person about someone else's enrolment.
+ 
+ When generating the synthesis, you MUST output your final findings strictly in the following JSON format without any surrounding text or markdown formatting:
+ {
+-  "rejection_description": "<detailed explanation of why the rejection occurred>",
+-  "synthesis": "<what did the resident intend to do, when and where did the packet fail or deviate from the intended result, and the resolution. MAXIMUM 2 to 3 sentences. Be extremely concise.>",
++  "rejection_description": "<the technical record of the rejection: the rule that rejected the packet, how this packet met it, and every packet-specific fact behind it, written as set out below>",
++  "synthesis": "<what the resident tried to do, where and why the packet failed, and the resolution, in simple English. MAXIMUM 3 sentences. It may give key details, but no personal data, as set out below.>",
+   "action": "<must be one of: REPLAY, WHITELISTING, QC_REPLAY, RO_APPROVAL, RESIDENT_PACKET_RESUBMIT, MANUAL_REVIEW>",
+   "resident_action": "<must be one of: NEW_PACKET, NEW_PACKET_WITH_DIFFERENT_ARTIFACTS, RO_APPLICATION, PENDING>",
+   "confidence": <number between 0.0 and 1.0>
+ }
+ 
++### Writing `rejection_description`
++It is the technical record of the rejection for the operators who check the
++decision: the logic, and every fact behind it. Write it from the approved
++investigation, in this order:
++
++1. The rule, check or module that rejected the packet, and what it requires.
++2. How this packet met it: each condition, with the value that decided it.
++3. Every packet-specific fact the investigation reports, including each line
++   of its KEY FACTS list: every identifier involved -- each candidate or
++   matched record, the parent or master record it belongs to, and their EIDs
++   and UIDs -- and each classification, match result, score, threshold, count
++   and flag, with its value.
++
++Copy every identifier and value exactly as the investigation gives it, in
++full; mask or withhold none of them. Never shorten an identifier to its first
++characters, round a score, or replace a list with "several" or "one or more".
++When several records are involved, name each one with its own values. Leave
++out any fact the investigation reports as not in the logs.
++
++Leave out what does not explain the decision: timestamps (unless a condition
++depends on one), pod and topic names, what the service published or logged
++after the decision, and how complete the logs were.
++
++### Writing `synthesis`
++It is the summary of the case in simple English, at most 3 sentences: what
++the resident tried to do, where and why the packet failed, and the resolution
++the SERVICE POLICY gives for this case, without alternatives it does not give.
++It may give the details that matter, such as what matched and the deciding
++values, but no personal data: leave out EIDs, UIDs, VIDs, names, dates of
++birth, contact details and addresses.
++
+ ### Output contract (enforced)
+ This response is machine-validated. `action` and `resident_action` must be
+ exactly one of the listed values -- not a near-miss like "REPLAY_PACKET" or a
+@@ -56,7 +89,7 @@ fluent your explanation is.
+   from the reason code alone.
+ 
+ If the trace begins with an `EVIDENCE GAPS` banner, part of the window was
+-unreadable. Say so in `rejection_description` and keep `confidence` at or
++unreadable. Leave that out of `rejection_description`, but keep `confidence` at or
+ below 0.6 -- a high confidence drawn from a trace you were told is incomplete
+ is unsupported by construction, and the system will cap it anyway.
+ 
+diff --git a/tests/fixtures/composed_prompts/enu-biometric/investigator.md b/tests/fixtures/composed_prompts/enu-biometric/investigator.md
+index c7b4f52..61c6a7e 100644
+--- a/tests/fixtures/composed_prompts/enu-biometric/investigator.md
++++ b/tests/fixtures/composed_prompts/enu-biometric/investigator.md
+@@ -142,6 +142,27 @@ Because logs are fetched from highly concurrent microservices using a sliding wi
+ You MUST verify that any ERROR or failure you attribute to the current packet actually belongs to it. 
+ If an ERROR line explicitly mentions a `refId`, `eventId`, or `uid` that does NOT match the Kafka payload you were provided, you MUST completely ignore it. It is noise from a concurrent request.
+ 
++### KEY FACTS -- END YOUR FINDINGS WITH THIS LIST
++
++The Synthesis Agent writes the casebook from your findings alone: a fact you
++leave out of them never reaches it. End your findings with a section headed
++`KEY FACTS` that lists every packet-specific fact the evidence gives about the
++decision, one fact per line:
++
++- the rule, check or module that rejected the packet, as the logs name it;
++- every identifier the decision involved -- each candidate or matched record,
++  the parent or master record it belongs to, and their EIDs and UIDs --
++  written in full, exactly as logged, never shortened to its first characters;
++- each classification, match result, score, threshold, count and flag recorded
++  for this packet, with its exact value.
++
++After each fact, quote the log line it comes from, or name the tool that
++returned it; quote a line once when it gives several facts. Take these facts
++only from this packet's own lines and tool results, never from a `[context]`
++line or another packet's line. On one last line, `Not in the logs: ...`, name
++the facts the SERVICE CONTEXT asks for that the evidence does not show,
++instead of leaving them out or guessing them.
++
+ Determine exactly why the packet failed validation or execution.
+ Pass your detailed technical findings and DB rule analysis to the ReviewerAgent.
+ 
+@@ -164,7 +185,17 @@ Strictly adhere to these core policies:
+ - `DemoTD` = face matched **and** all nonDemo matched: a complete biometric match across every modality, not a face-only match.
+ 
+ ### Packet-specific facts to look for
+-For this service, the packet-specific facts in the logs and tool results are, for example, which candidates matched, whether they share this packet's parent, which modality matched, the scores, and when.
++For this service, the packet-specific facts in the logs and tool results are which candidates matched, whether they share this packet's parent, which modality matched, the scores, and when. Your KEY FACTS list must give each of the following that the evidence shows, under the names the service logs it with:
++- **The decision**: the policy batch that rejected the applicant (`Applicant got rejected by : <module>`), `Applicant rejected by Mdd for Non TD`, the action the applicant was filtered on (`Filtering Applicant based on action: <action>`), and a rule's `Final result for all candidates`.
++- **Each candidate**: its `candidateRefId` and the `masterRefId` set for it; its `packetType` and `packetStatus`; `isFalsePositive` and `isCannotDetermine`, and whether it was marked TD from False Positive or Cannot Determine; whether it is whitelisted; and whether it was filtered out, and why (ignored, rejected, Aadhaar cancelled, or the UID matches the applicant's).
++- **Match results**: `mandatoryMatched`, `nonMandatoryMatchCount` and `requiredThreshold` for each candidate, and the age threshold, match threshold and mandatory modalities the rule used.
++- **Scores**: for each candidate, `MinScore`, `MaxScore`, `GapScore`, `LowCount` and `Final Risk Score`.
++- **EIDs and UIDs**: every EID and UID the decision's lines show, exactly as logged, with the candidate each belongs to when the lines show that.
++- **Counts**: the candidates returned and purged, the distinct candidates, `TD candidates`, `Anomalous candidates`, `TD EIDs`, `Anomalous EIDs`, and the candidates with and without Aadhaar.
++- **The applicant**: `isUpdateCase`, `applicantUidPresent`, whether it is a first-time biometric update, and whether it is whitelisted.
++
++### Log lines that are not failures
++- `Error while converting object to json string: Topic cannot be null.` is logged at ERROR level but is not an error. Never report it as a failure or as the cause of the rejection.
+ 
+ ### SERVICE POLICY -- ENU Biometric (BIO stage, BIO_DEDUP) [enu-biometric]
+ # Agent Policy Context & Success Criteria
+diff --git a/tests/fixtures/composed_prompts/enu-biometric/synthesis.md b/tests/fixtures/composed_prompts/enu-biometric/synthesis.md
+index d5af3fe..1c89564 100644
+--- a/tests/fixtures/composed_prompts/enu-biometric/synthesis.md
++++ b/tests/fixtures/composed_prompts/enu-biometric/synthesis.md
+@@ -12,7 +12,9 @@ If a SERVICE DOCUMENTATION TOOLS section is present, you may use those tools to
+ check a term or a resolution the approved investigation relies on. The
+ approved investigation stays the basis of your answer: add no cause it does
+ not contain, and never take a value from the documentation as one of this
+-packet's.
++packet's. If the section says instead that the documentation could not be
++reached, say so in one short sentence at the end of `rejection_description`,
++such as "The service documentation could not be consulted.", and nowhere else.
+ 
+ ### Resolution guidance from the reason code documentation
+ 
+@@ -27,17 +29,48 @@ did not apply. When the section is absent, choose as you otherwise would.
+ 
+ **CRITICAL INSTRUCTION FOR REPLAYS**: If you determine the final `Action` should be `REPLAY` (or `QC_REPLAY`), you MUST first call the `queue_for_replay` tool to stage the packet for the OIS pipeline. Take every parameter from the payload you were given -- `id` is the eventId. Only after the tool returns success should you output your final JSON.
+ 
+-Never invent a parameter value. If a value is not present in the payload, do not guess it and do not copy one out of a log line. Resident contact details in particular are resolved downstream from `id`; supplying an address you inferred would notify the wrong person about someone else's enrolment.
++Never invent a `queue_for_replay` parameter value. If a value is not present in the payload, do not guess it and do not copy one out of a log line. Resident contact details in particular are resolved downstream from `id`; supplying an address you inferred would notify the wrong person about someone else's enrolment.
+ 
+ When generating the synthesis, you MUST output your final findings strictly in the following JSON format without any surrounding text or markdown formatting:
+ {
+-  "rejection_description": "<detailed explanation of why the rejection occurred>",
+-  "synthesis": "<what did the resident intend to do, when and where did the packet fail or deviate from the intended result, and the resolution. MAXIMUM 2 to 3 sentences. Be extremely concise.>",
++  "rejection_description": "<the technical record of the rejection: the rule that rejected the packet, how this packet met it, and every packet-specific fact behind it, written as set out below>",
++  "synthesis": "<what the resident tried to do, where and why the packet failed, and the resolution, in simple English. MAXIMUM 3 sentences. It may give key details, but no personal data, as set out below.>",
+   "action": "<must be one of: REPLAY, WHITELISTING, QC_REPLAY, RO_APPROVAL, RESIDENT_PACKET_RESUBMIT, MANUAL_REVIEW>",
+   "resident_action": "<must be one of: NEW_PACKET, NEW_PACKET_WITH_DIFFERENT_ARTIFACTS, RO_APPLICATION, PENDING>",
+   "confidence": <number between 0.0 and 1.0>
+ }
+ 
++### Writing `rejection_description`
++It is the technical record of the rejection for the operators who check the
++decision: the logic, and every fact behind it. Write it from the approved
++investigation, in this order:
++
++1. The rule, check or module that rejected the packet, and what it requires.
++2. How this packet met it: each condition, with the value that decided it.
++3. Every packet-specific fact the investigation reports, including each line
++   of its KEY FACTS list: every identifier involved -- each candidate or
++   matched record, the parent or master record it belongs to, and their EIDs
++   and UIDs -- and each classification, match result, score, threshold, count
++   and flag, with its value.
++
++Copy every identifier and value exactly as the investigation gives it, in
++full; mask or withhold none of them. Never shorten an identifier to its first
++characters, round a score, or replace a list with "several" or "one or more".
++When several records are involved, name each one with its own values. Leave
++out any fact the investigation reports as not in the logs.
++
++Leave out what does not explain the decision: timestamps (unless a condition
++depends on one), pod and topic names, what the service published or logged
++after the decision, and how complete the logs were.
++
++### Writing `synthesis`
++It is the summary of the case in simple English, at most 3 sentences: what
++the resident tried to do, where and why the packet failed, and the resolution
++the SERVICE POLICY gives for this case, without alternatives it does not give.
++It may give the details that matter, such as what matched and the deciding
++values, but no personal data: leave out EIDs, UIDs, VIDs, names, dates of
++birth, contact details and addresses.
++
+ ### Output contract (enforced)
+ This response is machine-validated. `action` and `resident_action` must be
+ exactly one of the listed values -- not a near-miss like "REPLAY_PACKET" or a
+@@ -56,7 +89,7 @@ fluent your explanation is.
+   from the reason code alone.
+ 
+ If the trace begins with an `EVIDENCE GAPS` banner, part of the window was
+-unreadable. Say so in `rejection_description` and keep `confidence` at or
++unreadable. Leave that out of `rejection_description`, but keep `confidence` at or
+ below 0.6 -- a high confidence drawn from a trace you were told is incomplete
+ is unsupported by construction, and the system will cap it anyway.
+ 
+@@ -81,6 +114,11 @@ Strictly adhere to these core policies:
+ 
+ Translate raw rule conditions, such as `isApplicantWhiteListed: false`, with the SERVICE POLICY's "How to Interpret Rejections" section.
+ 
++### `rejection_description` for this service
++- Name the policy batch or module that rejected the applicant, and the action or rule condition it rejected on.
++- Then take each candidate the decision involved, in turn: its refId and its parent (`masterRefId`) in full, its EID and UID where the investigation gives them, whether that parent is the applicant's own, its classification (TD, anomalous, FP or Cannot Determine), and its match results and scores against the thresholds the rule used.
++- Give the counts the decision rested on, such as the TD and anomalous candidates and EIDs.
++
+ ### SERVICE POLICY -- ENU Biometric (BIO stage, BIO_DEDUP) [enu-biometric]
+ # Agent Policy Context & Success Criteria
+ 
+diff --git a/tests/fixtures/composed_prompts/enu-demographic/investigator.md b/tests/fixtures/composed_prompts/enu-demographic/investigator.md
+index dee3589..a22d2b3 100644
+--- a/tests/fixtures/composed_prompts/enu-demographic/investigator.md
++++ b/tests/fixtures/composed_prompts/enu-demographic/investigator.md
+@@ -142,6 +142,27 @@ Because logs are fetched from highly concurrent microservices using a sliding wi
+ You MUST verify that any ERROR or failure you attribute to the current packet actually belongs to it. 
+ If an ERROR line explicitly mentions a `refId`, `eventId`, or `uid` that does NOT match the Kafka payload you were provided, you MUST completely ignore it. It is noise from a concurrent request.
+ 
++### KEY FACTS -- END YOUR FINDINGS WITH THIS LIST
++
++The Synthesis Agent writes the casebook from your findings alone: a fact you
++leave out of them never reaches it. End your findings with a section headed
++`KEY FACTS` that lists every packet-specific fact the evidence gives about the
++decision, one fact per line:
++
++- the rule, check or module that rejected the packet, as the logs name it;
++- every identifier the decision involved -- each candidate or matched record,
++  the parent or master record it belongs to, and their EIDs and UIDs --
++  written in full, exactly as logged, never shortened to its first characters;
++- each classification, match result, score, threshold, count and flag recorded
++  for this packet, with its exact value.
++
++After each fact, quote the log line it comes from, or name the tool that
++returned it; quote a line once when it gives several facts. Take these facts
++only from this packet's own lines and tool results, never from a `[context]`
++line or another packet's line. On one last line, `Not in the logs: ...`, name
++the facts the SERVICE CONTEXT asks for that the evidence does not show,
++instead of leaving them out or guessing them.
++
+ Determine exactly why the packet failed validation or execution.
+ Pass your detailed technical findings and DB rule analysis to the ReviewerAgent.
+ 
+diff --git a/tests/fixtures/composed_prompts/enu-demographic/synthesis.md b/tests/fixtures/composed_prompts/enu-demographic/synthesis.md
+index 7f02c88..45f3a1c 100644
+--- a/tests/fixtures/composed_prompts/enu-demographic/synthesis.md
++++ b/tests/fixtures/composed_prompts/enu-demographic/synthesis.md
+@@ -12,7 +12,9 @@ If a SERVICE DOCUMENTATION TOOLS section is present, you may use those tools to
+ check a term or a resolution the approved investigation relies on. The
+ approved investigation stays the basis of your answer: add no cause it does
+ not contain, and never take a value from the documentation as one of this
+-packet's.
++packet's. If the section says instead that the documentation could not be
++reached, say so in one short sentence at the end of `rejection_description`,
++such as "The service documentation could not be consulted.", and nowhere else.
+ 
+ ### Resolution guidance from the reason code documentation
+ 
+@@ -27,17 +29,48 @@ did not apply. When the section is absent, choose as you otherwise would.
+ 
+ **CRITICAL INSTRUCTION FOR REPLAYS**: If you determine the final `Action` should be `REPLAY` (or `QC_REPLAY`), you MUST first call the `queue_for_replay` tool to stage the packet for the OIS pipeline. Take every parameter from the payload you were given -- `id` is the eventId. Only after the tool returns success should you output your final JSON.
+ 
+-Never invent a parameter value. If a value is not present in the payload, do not guess it and do not copy one out of a log line. Resident contact details in particular are resolved downstream from `id`; supplying an address you inferred would notify the wrong person about someone else's enrolment.
++Never invent a `queue_for_replay` parameter value. If a value is not present in the payload, do not guess it and do not copy one out of a log line. Resident contact details in particular are resolved downstream from `id`; supplying an address you inferred would notify the wrong person about someone else's enrolment.
+ 
+ When generating the synthesis, you MUST output your final findings strictly in the following JSON format without any surrounding text or markdown formatting:
+ {
+-  "rejection_description": "<detailed explanation of why the rejection occurred>",
+-  "synthesis": "<what did the resident intend to do, when and where did the packet fail or deviate from the intended result, and the resolution. MAXIMUM 2 to 3 sentences. Be extremely concise.>",
++  "rejection_description": "<the technical record of the rejection: the rule that rejected the packet, how this packet met it, and every packet-specific fact behind it, written as set out below>",
++  "synthesis": "<what the resident tried to do, where and why the packet failed, and the resolution, in simple English. MAXIMUM 3 sentences. It may give key details, but no personal data, as set out below.>",
+   "action": "<must be one of: REPLAY, WHITELISTING, QC_REPLAY, RO_APPROVAL, RESIDENT_PACKET_RESUBMIT, MANUAL_REVIEW>",
+   "resident_action": "<must be one of: NEW_PACKET, NEW_PACKET_WITH_DIFFERENT_ARTIFACTS, RO_APPLICATION, PENDING>",
+   "confidence": <number between 0.0 and 1.0>
+ }
+ 
++### Writing `rejection_description`
++It is the technical record of the rejection for the operators who check the
++decision: the logic, and every fact behind it. Write it from the approved
++investigation, in this order:
++
++1. The rule, check or module that rejected the packet, and what it requires.
++2. How this packet met it: each condition, with the value that decided it.
++3. Every packet-specific fact the investigation reports, including each line
++   of its KEY FACTS list: every identifier involved -- each candidate or
++   matched record, the parent or master record it belongs to, and their EIDs
++   and UIDs -- and each classification, match result, score, threshold, count
++   and flag, with its value.
++
++Copy every identifier and value exactly as the investigation gives it, in
++full; mask or withhold none of them. Never shorten an identifier to its first
++characters, round a score, or replace a list with "several" or "one or more".
++When several records are involved, name each one with its own values. Leave
++out any fact the investigation reports as not in the logs.
++
++Leave out what does not explain the decision: timestamps (unless a condition
++depends on one), pod and topic names, what the service published or logged
++after the decision, and how complete the logs were.
++
++### Writing `synthesis`
++It is the summary of the case in simple English, at most 3 sentences: what
++the resident tried to do, where and why the packet failed, and the resolution
++the SERVICE POLICY gives for this case, without alternatives it does not give.
++It may give the details that matter, such as what matched and the deciding
++values, but no personal data: leave out EIDs, UIDs, VIDs, names, dates of
++birth, contact details and addresses.
++
+ ### Output contract (enforced)
+ This response is machine-validated. `action` and `resident_action` must be
+ exactly one of the listed values -- not a near-miss like "REPLAY_PACKET" or a
+@@ -56,7 +89,7 @@ fluent your explanation is.
+   from the reason code alone.
+ 
+ If the trace begins with an `EVIDENCE GAPS` banner, part of the window was
+-unreadable. Say so in `rejection_description` and keep `confidence` at or
++unreadable. Leave that out of `rejection_description`, but keep `confidence` at or
+ below 0.6 -- a high confidence drawn from a trace you were told is incomplete
+ is unsupported by construction, and the system will cap it anyway.
+ 
+diff --git a/tests/test_service_prompts.py b/tests/test_service_prompts.py
+index 5f44a70..434f132 100644
+--- a/tests/test_service_prompts.py
++++ b/tests/test_service_prompts.py
+@@ -60,9 +60,11 @@ REWRITTEN_DIRECT = {
+         "Where the documentation names the evidence to look": [
+             "   facts that matter for this service. Where the documentation names the "
+             "evidence to look",
+-            "For this service, the packet-specific facts in the logs and tool results are, "
+-            "for example, which candidates matched, whether they share this packet's "
+-            "parent, which modality matched, the scores, and when."],
++            "For this service, the packet-specific facts in the logs and tool results are "
++            "which candidates matched, whether they share this packet's parent, which "
++            "modality matched, the scores, and when. Your KEY FACTS list must give each of "
++            "the following that the evidence shows, under the names the service logs it "
++            "with:"],
+         "This is the single most important framing fact for your analysis:": [
+             "This is the single most important framing fact for your analysis. What each "
+             "type means for this packet's service, and which rules apply to it, is set out "
+@@ -105,6 +107,35 @@ REWRITTEN_DIRECT = {
+             "conditions into human-readable resolutions for the operator.",
+             "Translate raw rule conditions, such as `isApplicantWhiteListed: false`, with "
+             "the SERVICE POLICY's \"How to Interpret Rejections\" section."],
++        # rejection_description shortened refIds and dropped scores, and gave
++        # its room to evidence gaps instead. It is now the technical record of
++        # the decision and synthesis a shorter summary. The replay rule's "do
++        # not copy one out of a log line" now names the tool it is about.
++        "Never invent a parameter value. If a value is not present in the payload, do "
++        "not guess it and do not copy one out of a log line. Resident contact details in "
++        "particular are resolved downstream from `id`; supplying an address you inferred "
++        "would notify the wrong person about someone else's enrolment.": [
++            "Never invent a `queue_for_replay` parameter value. If a value is not present "
++            "in the payload, do not guess it and do not copy one out of a log line. "
++            "Resident contact details in particular are resolved downstream from `id`; "
++            "supplying an address you inferred would notify the wrong person about "
++            "someone else's enrolment."],
++        '  "rejection_description": "<detailed explanation of why the rejection '
++        'occurred>",': [
++            '  "rejection_description": "<the technical record of the rejection: the rule '
++            'that rejected the packet, how this packet met it, and every packet-specific '
++            'fact behind it, written as set out below>",',
++            "### Writing `rejection_description`"],
++        '  "synthesis": "<what did the resident intend to do, when and where did the '
++        'packet fail or deviate from the intended result, and the resolution. MAXIMUM 2 '
++        'to 3 sentences. Be extremely concise.>",': [
++            '  "synthesis": "<what the resident tried to do, where and why the packet '
++            'failed, and the resolution, in simple English. MAXIMUM 3 sentences. It may '
++            'give key details, but no personal data, as set out below.>",',
++            "### Writing `synthesis`"],
++        "unreadable. Say so in `rejection_description` and keep `confidence` at or": [
++            "unreadable. Leave that out of `rejection_description`, but keep `confidence` "
++            "at or"],
+     },
+ }
+ 
