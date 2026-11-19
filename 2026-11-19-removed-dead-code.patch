@@ -1,0 +1,391 @@
+diff --git a/ARCHITECTURE.md b/ARCHITECTURE.md
+index bd7f856..f00927a 100644
+--- a/ARCHITECTURE.md
++++ b/ARCHITECTURE.md
+@@ -1012,8 +1012,6 @@ agentic-resident-crm/
+ │       ├── resilience.py           # tenacity retries + pybreaker circuit breakers
+ │       ├── dlq_publisher.py        # Dead Letter Queue producer
+ │       ├── analysis_queue_publisher.py # Publishes fetched payloads onto the analysis queue
+-│       ├── s3_uploader.py          # Standalone S3 log upload. NOT on the request path any more --
+-│       │                           #   logs go through CasebookStorage.save_artifact (section 3.3)
+ │       ├── runbook_store.py        # Runbook load/save, TTL cache, fingerprinting, path guard
+ │       ├── runbook_validator.py    # Generic-text regex validator (no UUIDs/dates/SRNs)
+ │       ├── kafka_producer.py       # Single shared KafkaProducer for DLQ + analysis + DLT queues
+@@ -1888,7 +1886,7 @@ Instead of relying on an unpredictable LLM to orchestrate the subagents, the sys
+ 
+    > **Nothing is written here.** This step used to `save_artifact(event_id, "supported_logs.txt", ...)` from the final graph state. That state is only ever the content of `fetched_logs.txt`, or of `filtered_logs.txt` when the LogFilter replaced it, so the write produced a byte-for-byte duplicate of an object already in the store -- and nothing ever read the duplicate back. `reduce_logs` had the same shape: it wrote `reduced_logs.txt` and then returned the identical string, which both production callers persist themselves as `fetched_logs.txt` (`fetch_and_persist_logs` in the rejection lane, `dlt_routes` in the DLT lane). Both writes are gone. A rejected packet's S3 prefix therefore holds `fetched_logs.txt` as the single canonical reduced trace, and `filtered_logs.txt` only when `ENABLE_LOG_FILTER_AGENT=true` -- five log objects down to two (section 3.8), beside the Kubernetes source's own snapshot. `reduced_logs.txt` is deliberately still listed in `prune_casesheets.LOG_ARTEFACTS` so cases written before this change are still cleaned up. The field was always a locator rather than the text, so no reader changes. The `gaps` field carries the evidence-gap banner lifted out of the raw trace (matched on `BANNER_HEADER`/`BANNER_FOOTER` from `k8s/gaps.py`) so operators retain the incompleteness warning without inline clutter.
+ 
+-   > **`upload_logs_to_s3()` is no longer on this path.** `src/utils/s3_uploader.py` still exists and still works, but nothing in `src/` calls it -- only its own tests do. Routing the trace through the storage abstraction instead means a deployment on `CASEBOOK_STORAGE_BACKEND=s3` already lands the logs in S3, beside the casebook that cites them, under one set of credentials and one retention policy. `S3_LOGS_BUCKET` survives only as a fallback name for `CASEBOOK_S3_BUCKET` (in `config_validator`, the S3 storage backend and the reason-code downloads).
++   > **`upload_logs_to_s3()` is no longer on this path.** `src/utils/s3_uploader.py`, which nothing in `src/` called any more, has been removed. Routing the trace through the storage abstraction instead means a deployment on `CASEBOOK_STORAGE_BACKEND=s3` already lands the logs in S3, beside the casebook that cites them, under one set of credentials and one retention policy. `S3_LOGS_BUCKET` survives only as a fallback name for `CASEBOOK_S3_BUCKET` (in `config_validator`, the S3 storage backend and the reason-code downloads).
+ 
+ ### 3.4 Resilience & Hardening (Phase 1 & 2)
+ The architecture incorporates several resilience mechanisms to prevent runaway costs, silent failures, file corruption, and pipeline deadlocks:
+@@ -1902,7 +1900,7 @@ The architecture incorporates several resilience mechanisms to prevent runaway c
+ - **Safe Self-Learning & Drift Checks**: The Reviewer's `add_learning_rule` tool stages suggestions to `src/prompts/pending_rules.jsonl` using `filelock`. A human runs `src/tools/promote_rules.py` (which includes top-level locking and git-status safety checks) to approve the rules -- committing them is opt-in (`--commit`), so promoting and committing stay separate decisions; only promoted entries are removed from the pending file, so skipped/errored/concurrently-appended entries survive. Additionally, `src/tools/check_drift.py` detects database schema/policy drift, and distinguishes a genuinely changed schema from a malformed single-column CSV export.
+ - **External Call Resilience**: `tenacity` handles exponential backoff retries, and `pybreaker` provides circuit breakers for database, Elasticsearch, LLM, Kubernetes, and Bitbucket calls (`db_breaker`, `process_db_breaker`, `es_breaker`, `llm_breaker`, `k8s_breaker`, `bitbucket_breaker` -- all `fail_max=3`, `reset_timeout=60`). They are `resilience.CircuitBreaker`, a subclass that overrides `call()` alone: pybreaker 1.4.1 (its latest release) runs the guarded call while holding the breaker's lock, so every call through a shared breaker waited for the one before it -- the API made one LLM call at a time however many investigations it ran, and log fetches, rule lookups and Bitbucket reads queued the same way (one traced packet spent 9m23s of 12m45s waiting before its agents started, 2026-10-07). The subclass takes the lock only to admit a call and to record its outcome, through pybreaker's own state objects, so tripping at `fail_max` (with `CircuitBreakerError` on the tripping call), refusing while open, the half-open trial and excluded exceptions behave as before; calls arriving during a trial go ahead beside it rather than queueing. It uses pybreaker internals (`_lock`, `_state_storage`, the state objects' `_handle_error`/`_handle_success`); `tests/test_breaker_concurrency.py` pins both the behaviour and the upstream defect, so an upgrade that changes either fails loudly. The deliberate limit that replaced the accidental one is `LLM_MAX_CONCURRENT_CALLS` (default 2): every agent's `ModelCallSlotMiddleware` holds one of the process's slots for each model call -- never across a tool call or a retry's backoff -- and a wait for one is recorded in the trace as `wait-for-model-slot`; an abandoned run stops waiting within a second. Every one is sampled onto the `breaker_state` gauge at scrape time rather than on transition, so a breaker that reset on a timeout doesn't leave a stale "open" reading behind. The two newest are read-only paths whose failure must only ever *degrade* a result: a tripped `k8s_breaker` makes the running image version unknown, and a tripped `bitbucket_breaker` makes a replay-precheck verdict `UNKNOWN` -- neither raises into the analysis lane.
+ - **Storage Abstraction & Schema Versioning**: The `CasebookStorage` interface implements retried atomic `.tmp` writes (to safely handle concurrent readers/AV scanners holding the file on Windows) and enforces a `"schema_version"` field on every saved casebook for backwards compatibility.
+-- **Structured Logging & Health Checks**: `agent_orchestrator.py`, `tool_registry.py`, `kafkaConsumer.py`, `dlq_publisher.py`, `analysis_queue_publisher.py`, `s3_uploader.py` and the entire `log_pipeline/` package log through the same `structlog` logger as `routes.py` (bound to `event_id` where available) rather than bare `print()`. Verbosity is set by `LOG_LEVEL`. The operator CLIs still print to stdout deliberately -- they are interactive tools, not services. The FastAPI server provides `/health` and `/ready`. `/health` reports this process's own `status`/`draining`/`in_flight`/`capacity`, plus a heartbeat block for each of the four consumer roles (`fast_consumer`, `slow_consumer`, `dlt_consumer`, `dlt_analysis_consumer`) and a top-level `last_heartbeat`/`consumer_alive` alias for the fast consumer that predates the split. A heartbeat file that is absent reads as `null`, not `false` -- "unknown", not "dead" -- because a split-pod deployment has no local heartbeat file for any consumer, and the DLT roles are off by default; each consumer answers its own liveness on `CONSUMER_HEALTH_PORT` / `SLOW_CONSUMER_HEALTH_PORT` / `DLT_HEALTH_PORT` / `DLT_ANALYSIS_HEALTH_PORT` instead. `/ready` verifies checkpoint store connectivity and Kafka producer reachability (cached for `PRODUCER_HEALTH_TTL_SECONDS`, default 30s). When the API runs its own agent tool server, `/ready` also returns 503 "Starting agent tool server" until that answers its health check -- so consumers do not forward packets before the agents can reach their tools -- and it returns 503 "Downloading ..." until the first copy of the reason-code documentation (with `REASON_CODE_DOCS_S3_DOWNLOAD=true`) and of the reason-code service map (with `REASON_CODE_SERVICE_MAP_S3_KEY` set) is on disk. `validate_config()` provides fail-fast configuration validation at boot.
++- **Structured Logging & Health Checks**: `agent_orchestrator.py`, `tool_registry.py`, `kafkaConsumer.py`, `dlq_publisher.py`, `analysis_queue_publisher.py` and the entire `log_pipeline/` package log through the same `structlog` logger as `routes.py` (bound to `event_id` where available) rather than bare `print()`. Verbosity is set by `LOG_LEVEL`. The operator CLIs still print to stdout deliberately -- they are interactive tools, not services. The FastAPI server provides `/health` and `/ready`. `/health` reports this process's own `status`/`draining`/`in_flight`/`capacity`, plus a heartbeat block for each of the four consumer roles (`fast_consumer`, `slow_consumer`, `dlt_consumer`, `dlt_analysis_consumer`) and a top-level `last_heartbeat`/`consumer_alive` alias for the fast consumer that predates the split. A heartbeat file that is absent reads as `null`, not `false` -- "unknown", not "dead" -- because a split-pod deployment has no local heartbeat file for any consumer, and the DLT roles are off by default; each consumer answers its own liveness on `CONSUMER_HEALTH_PORT` / `SLOW_CONSUMER_HEALTH_PORT` / `DLT_HEALTH_PORT` / `DLT_ANALYSIS_HEALTH_PORT` instead. `/ready` verifies checkpoint store connectivity and Kafka producer reachability (cached for `PRODUCER_HEALTH_TTL_SECONDS`, default 30s). When the API runs its own agent tool server, `/ready` also returns 503 "Starting agent tool server" until that answers its health check -- so consumers do not forward packets before the agents can reach their tools -- and it returns 503 "Downloading ..." until the first copy of the reason-code documentation (with `REASON_CODE_DOCS_S3_DOWNLOAD=true`) and of the reason-code service map (with `REASON_CODE_SERVICE_MAP_S3_KEY` set) is on disk. `validate_config()` provides fail-fast configuration validation at boot.
+ - **Agent Caching**: The Investigator, LogFilter, Synthesis and Reviewer deep agents (and the DLT lane's three) are all created once at graph construction time and reused across invocations, avoiding per-packet (and, for the Reviewer, per-retry) LLM handshake overhead.
+ - **Local Casebook Cleanup**: Every `save_terminal()` call site -- success, timeout, DLQ, shutdown straggler, consumer-side timeout, and both DLT lanes -- is followed by `cleanup_casebook_dir()`, which removes the local `casebook_{id}/` working directory. Under `CASEBOOK_STORAGE_BACKEND=s3` this is safe: the terminal casebook is already in S3, and the dedupe check (`storage.exists(..., terminal_only=True)`) reads it from there, not from local disk. Under the default `local` backend that directory *is* the record: `LocalFilesystemCasebookStorage` writes `casebook.json` and `status.json` into `LOCAL_CASESHEETS_DIR/casebook_{id}/`. Deleting it erased every finished casebook the moment it was saved, so a redelivery passed the terminal-casebook check and was analysed again (seen 2026-09-29). Since 2026-09-30 neither the cleanup nor the reaper touches a directory that holds a local record (`case_cleanup._is_local_record`: the backend is local, rooted where the directory sits, and the directory holds `casebook.json` or `status.json`); when the backend cannot be built, the directory is kept, since a stray working directory costs disk and a deleted record costs a casebook. A background reaper daemon (started in `main_api.py` lifespan) scans `LOCAL_CASESHEETS_DIR` every `CASEBOOK_REAPER_INTERVAL_SECONDS` (default 300s) and removes directories whose mtime is older than `CASEBOOK_LOCAL_TTL_SECONDS` (default 3600s), catching those left by crashes, OOM kills, or any path where the immediate cleanup did not run. It matches **only entries named `casebook_*`**, which is load-bearing rather than incidental: `packet_claims/`, `dlt_cases/`, `dlt_claims/`, `dlt_groups/`, `dlt_parked_replays/` and `pending_replays/` sit in the same directory under a local storage backend and are durable state -- a parked replay legitimately waits weeks for a deploy (section 4.4.1), and an unscoped TTL sweep would delete it. Neither layer ever raises: a cleanup failure must not turn a successful case into a failed one. `src/utils/case_cleanup.py`.
+ - **Non-Blocking Request Handling**: `/process-rejection` and `/analyze-rejection` are both `async def`; `agent.invoke()` runs on a dedicated `ThreadPoolExecutor` sized to `MAX_CONCURRENT_INVESTIGATIONS`, separate from Starlette's own sync-dispatch threadpool. A multi-minute investigation therefore can't starve `/health`, `/ready`, `/fetch-logs`, or the sync auth/rate-limit dependencies of a worker slot. `/fetch-logs` is deliberately plain `def`, not `async def` -- its bounded I/O runs on Starlette's own threadpool, the same one `/health`/`/ready` use, since it never needs the dedicated executor a multi-minute LLM call does.
+@@ -3801,7 +3799,7 @@ code changed; the corrections below are all places this document had drifted.
+ | 3.8 | `schema_version` `"1.1"` | `"1.2"` -- `1.1` -> `1.2` added the optional `resolution_outcome` block, additively |
+ | 3.8 | `packet_metadata.eid`; `update_type` null | `sid` replaced `eid`; `update_type` carries the raw `enrolmentType` |
+ | 3.8 | `resolution` had four keys | plus `confidence`, `abstained`, `provenance`, optional `shadow`; and `casebook_metadata` is a top-level block |
+-| 1.3.1, 3.3 | logs over 5000 chars went to `upload_logs_to_s3()`, else truncated | no threshold: the trace is always persisted whole via `CasebookStorage.save_artifact` as `supported_logs.txt`. `s3_uploader.py` is no longer called from `src/` at all |
++| 1.3.1, 3.3 | logs over 5000 chars went to `upload_logs_to_s3()`, else truncated | no threshold: the trace is always persisted whole via `CasebookStorage.save_artifact` as `supported_logs.txt`. `s3_uploader.py` has since been removed |
+ | 1.3.1 | `PACKET_TIMEOUT_SECONDS=500` | the default is `300` |
+ | 3.4 | six terminal statuses | eight -- `FAILED_SYNTHESIS_PARSE` and `FAILED_SHUTDOWN` were missing |
+ | 3.4 | `/health` reported two consumers | four, plus `status`/`draining`/`in_flight`/`capacity` |
+diff --git a/README.md b/README.md
+index d59459e..237d964 100644
+--- a/README.md
++++ b/README.md
+@@ -239,12 +239,10 @@ flowchart TD
+         OUT -->|"unhandled exception"| DQ["publish_to_dlq +<br/>save_terminal DLQ"]
+         OUT -->|"returned a state"| PARSE{"parse_synthesis<br/>against the contract"}
+         PARSE -->|invalid| FSP["FAILED_SYNTHESIS_PARSE<br/>evidence kept, verdict replaced"]
+-        PARSE -->|valid| LOGSZ{"raw logs size"}
+-        LOGSZ -->|"none / 'Log fetching disabled.'"| BUILD
+-        LOGSZ -->|"5000 chars or fewer"| BUILD["build casebook"]
+-        LOGSZ -->|"over 5000 chars"| S3{"upload_logs_to_s3"}
+-        S3 -->|"URL"| BUILD
+-        S3 -->|"None: no bucket or failed"| TRUNC["truncate to 5000 + notice"] --> BUILD
++        PARSE -->|valid| LOGSZ{"raw logs present?"}
++        LOGSZ -->|"none / 'Log fetching disabled.'"| NOLOG["evidence.log_path =<br/>'No logs found'"] --> BUILD
++        LOGSZ -->|yes| ART2["no write: the text is already stored"]
++        ART2 --> BUILD["build casebook<br/>evidence.log_path = state logs_artifact<br/>fetched_logs.txt, or filtered_logs.txt"]
+         FSP --> BUILD
+         BUILD --> LATE{"terminal_status in<br/>PROTECTED_TERMINAL_STATUSES<br/>FAILED_TIMEOUT, DLQ?"}
+         LATE -->|"yes: another actor won"| DISC["discard late result"]
+@@ -815,7 +813,6 @@ agentic-resident-crm/
+ │       ├── resilience.py           # tenacity retries + pybreaker circuit breakers
+ │       ├── dlq_publisher.py        # Dead Letter Queue producer
+ │       ├── analysis_queue_publisher.py # Publishes fetched payloads onto the analysis queue
+-│       ├── s3_uploader.py          # Uploads large Elastic logs to S3
+ │       ├── runbook_store.py        # Runbook load/save, TTL cache, fingerprinting, path guard
+ │       ├── runbook_validator.py    # Generic-text regex validator (no UUIDs/dates/SRNs)
+ │       ├── kafka_producer.py       # Single shared KafkaProducer for DLQ + analysis + DLT queues
+@@ -895,7 +892,7 @@ The architecture incorporates several resilience mechanisms to prevent runaway c
+ - **Safe Self-Learning & Drift Checks**: The Reviewer's `add_learning_rule` tool stages suggestions to `src/prompts/pending_rules.jsonl` using `filelock`. A human runs `src/tools/promote_rules.py` (which includes top-level locking and git-status safety checks) to approve and Git-commit the rules; only promoted entries are removed from the pending file, so skipped/errored/concurrently-appended entries survive. Additionally, `src/tools/check_drift.py` detects database schema/policy drift, and distinguishes a genuinely changed schema from a malformed single-column CSV export.
+ - **External Call Resilience**: `tenacity` handles exponential backoff retries, and `pybreaker` provides circuit breakers for database, Elasticsearch, LLM, Kubernetes, and Bitbucket calls (`db_breaker`, `process_db_breaker`, `es_breaker`, `llm_breaker`, `k8s_breaker`, `bitbucket_breaker` -- all `fail_max=3`, `reset_timeout=60`). They are `resilience.CircuitBreaker`, which keeps pybreaker's behaviour but not its lock around the guarded call: pybreaker held it for the whole call, so the API made one LLM call at a time and log fetches and rule lookups queued the same way. How many model calls run at once is now a deliberate per-process limit, `LLM_MAX_CONCURRENT_CALLS` (default 2). Every one is sampled onto the `breaker_state` gauge at scrape time rather than on transition, so a breaker that reset on a timeout doesn't leave a stale "open" reading behind. The two newest are read-only paths whose failure must only ever *degrade* a result: a tripped `k8s_breaker` makes the running image version unknown, and a tripped `bitbucket_breaker` makes a replay-precheck verdict `UNKNOWN` -- neither raises into the analysis lane.
+ - **Storage Abstraction & Schema Versioning**: The `CasebookStorage` interface implements retried atomic `.tmp` writes (to safely handle concurrent readers/AV scanners holding the file on Windows) and enforces a `"schema_version"` field on every saved casebook for backwards compatibility.
+-- **Structured Logging & Health Checks**: `agent_orchestrator.py`, `tool_registry.py`, `kafkaConsumer.py`, `dlq_publisher.py`, `analysis_queue_publisher.py`, `s3_uploader.py` and the entire `log_pipeline/` package log through the same `structlog` logger as `routes.py` (bound to `event_id` where available) rather than bare `print()`. Verbosity is set by `LOG_LEVEL`. The operator CLIs still print to stdout deliberately -- they are interactive tools, not services. The FastAPI server provides `/health` (reporting both the fast and slow consumers' heartbeats, under `fast_consumer`/`slow_consumer`, plus a top-level `last_heartbeat`/`consumer_alive` alias for the fast consumer that predates the split) and `/ready` (verifying SQLite and Kafka producer connectivity) endpoints; the Kafka producer check is cached for `PRODUCER_HEALTH_TTL_SECONDS` (default 30s) so a burst of readiness probes can't each force a fresh broker connection attempt. `validate_config()` provides fail-fast configuration validation at boot.
++- **Structured Logging & Health Checks**: `agent_orchestrator.py`, `tool_registry.py`, `kafkaConsumer.py`, `dlq_publisher.py`, `analysis_queue_publisher.py` and the entire `log_pipeline/` package log through the same `structlog` logger as `routes.py` (bound to `event_id` where available) rather than bare `print()`. Verbosity is set by `LOG_LEVEL`. The operator CLIs still print to stdout deliberately -- they are interactive tools, not services. The FastAPI server provides `/health` (reporting both the fast and slow consumers' heartbeats, under `fast_consumer`/`slow_consumer`, plus a top-level `last_heartbeat`/`consumer_alive` alias for the fast consumer that predates the split) and `/ready` (verifying SQLite and Kafka producer connectivity) endpoints; the Kafka producer check is cached for `PRODUCER_HEALTH_TTL_SECONDS` (default 30s) so a burst of readiness probes can't each force a fresh broker connection attempt. `validate_config()` provides fail-fast configuration validation at boot.
+ - **Langfuse Tracing (`src/utils/tracing.py`)**: Off unless `LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY` are set; off, agents are invoked exactly as before. On, each rejection investigation is one `analyze-rejection` trace (session: the eventId), each DLT analysis lane run one `analyze-dlt` trace (session: the case key) and each runbook draft one `draft-runbook` trace -- graph nodes as spans, every deep agent as an `agent` with its model calls as generations (model, tokens, reasoning) and its tool calls beside them. Every Reviewer verdict is visible -- a rejection is a WARNING naming the review number and the next step, each retry shows its attempt number and the feedback it answers -- and the verdicts, review counts and each packet's final status are recorded as filterable scores. Every span is redacted with the log pipeline's PII patterns and JSON keys before export, and tracing never fails a packet. Point `LANGFUSE_BASE_URL` at a self-hosted Langfuse inside the network. See ARCHITECTURE.md section 3.13 and `.env.example`.
+ - **Prompts from Langfuse (`PROMPT_SOURCE`)**: `files` (the default) reads every agent prompt and service pack text from the repository. `langfuse` reads them from Langfuse Prompt Management only -- the version labelled `production` -- with no fallback to the files: the API refuses to boot unless every prompt is there and passes the same checks a pack file does, and a version released in Langfuse reaches new packets within `LANGFUSE_PROMPT_CACHE_TTL_SECONDS`, while running packets finish on the versions they started on. Each model call is linked to its prompt version in the trace. Upload the prompt files with `python -m src.tools.upload_prompts --apply`. See ARCHITECTURE.md section 3.14.
+ - **Agent Caching**: Investigator, Synthesis, and Reviewer React agents are all created once at graph construction time and reused across invocations, avoiding per-packet (and, for the Reviewer, per-retry) LLM handshake overhead.
+diff --git a/src/dlt/corroborate.py b/src/dlt/corroborate.py
+index e9c82e3..80a934b 100644
+--- a/src/dlt/corroborate.py
++++ b/src/dlt/corroborate.py
+@@ -186,13 +186,6 @@ def _scan_lines(logs: str) -> list:
+     return scanned
+ 
+ 
+-def _error_lines(logs: str) -> list:
+-    """Every error-level line, attributed or not. Citations show both: a human
+-    checking the reading needs to see what was set aside as much as what was
+-    counted."""
+-    return [line.text for line in _scan_lines(logs) if line.error_level]
+-
+-
+ def corroborate(logs: Optional[str],
+                 root_fqcn: Optional[str],
+                 business_code: Optional[str] = None,
+diff --git a/src/dlt/single_flight.py b/src/dlt/single_flight.py
+index cc0c764..5032fc8 100644
+--- a/src/dlt/single_flight.py
++++ b/src/dlt/single_flight.py
+@@ -68,8 +68,6 @@ class Flight:
+     #: Another request for the same fingerprint was in flight on arrival, so
+     #: the group may have changed while this one waited.
+     waited: bool
+-    #: Seconds spent waiting for the gate.
+-    waited_seconds: float = 0.0
+ 
+ 
+ class _Entry:
+@@ -112,8 +110,7 @@ async def flight(fingerprint: str, timeout: float):
+                            fingerprint=fingerprint[:16],
+                            waited_seconds=round(time.monotonic() - started, 3))
+ 
+-        yield Flight(acquired=acquired, waited=waited,
+-                     waited_seconds=time.monotonic() - started)
++        yield Flight(acquired=acquired, waited=waited)
+     finally:
+         if acquired:
+             entry.lock.release()
+diff --git a/src/log_pipeline/snapshot.py b/src/log_pipeline/snapshot.py
+index a9c3944..ade3633 100644
+--- a/src/log_pipeline/snapshot.py
++++ b/src/log_pipeline/snapshot.py
+@@ -53,14 +53,6 @@ def snapshot_dir(event_id: str) -> Path:
+     return _casesheets_root() / f"casebook_{event_id}"
+ 
+ 
+-def _records_path(event_id: str) -> Path:
+-    return snapshot_dir(event_id) / RECORDS_FILENAME
+-
+-
+-def _meta_path(event_id: str) -> Path:
+-    return snapshot_dir(event_id) / META_FILENAME
+-
+-
+ def exists(event_id: str) -> bool:
+     """Through the storage seam, like save() and load().
+ 
+diff --git a/src/models/dlt_payload_schemas.py b/src/models/dlt_payload_schemas.py
+index b897707..9179ba8 100644
+--- a/src/models/dlt_payload_schemas.py
++++ b/src/models/dlt_payload_schemas.py
+@@ -168,7 +168,6 @@ class EnrolmentEventResponse(BaseModel):
+ 
+ TYPE_ENROLMENT_EVENT_RESPONSE = (
+     "in.gov.uidai.uidabismiddlewaresb.kafka.model.EnrolmentEventResponse")
+-TYPE_EVENT_MESSAGE = "com.uidai.enu.common.model.EventMessage"
+ 
+ #: `__TypeId__` -> ordered dotted paths at which the refId is known to sit.
+ #: Tried in order; the first scalar hit wins. An unregistered type falls
+@@ -179,7 +178,8 @@ REFID_PATHS_BY_TYPE: Dict[str, tuple] = {
+         "abisMWResponseNewSeda.refId",
+         "abisMWResponseNewSeda.abisResponses.referenceId",
+     ),
+-    # No payload has been captured for EventMessage yet -- the reference
++    # No payload has been captured for EventMessage
++    # (`com.uidai.enu.common.model.EventMessage`) yet -- the reference
+     # sample carried headers only. Left unregistered on purpose: a guessed
+     # path that silently misses is worse than the search, which at least
+     # reports `search` as its provenance.
+diff --git a/src/tools/mcp_config.py b/src/tools/mcp_config.py
+index d2136dd..0247181 100644
+--- a/src/tools/mcp_config.py
++++ b/src/tools/mcp_config.py
+@@ -46,7 +46,6 @@ import json
+ import os
+ import re
+ from dataclasses import dataclass
+-from typing import Optional
+ from urllib.parse import urlparse
+ 
+ ENV_SERVE = "AGENT_MCP_SERVE"
+@@ -56,8 +55,6 @@ ENV_SERVERS = "AGENT_MCP_SERVERS"
+ ENV_TIMEOUT = "AGENT_MCP_TIMEOUT_SECONDS"
+ ENV_RETRY = "AGENT_MCP_RETRY_SECONDS"
+ ENV_DOCS_ROLES = "AGENT_DOCS_ROLES"
+-SETTINGS = (ENV_SERVE, ENV_HOST, ENV_PORT, ENV_SERVERS, ENV_TIMEOUT, ENV_RETRY,
+-            ENV_DOCS_ROLES)
+ 
+ #: The name the bundled server is known by in the default server list.
+ LOCAL_SERVER_NAME = "agent_tools"
+@@ -224,10 +221,6 @@ def servers() -> list:
+     return []
+ 
+ 
+-def find_server(name: str) -> Optional[ServerConfig]:
+-    return next((server for server in servers() if server.name == name), None)
+-
+-
+ def of_kind(configured, kind: str) -> tuple:
+     """The servers in `configured` of `kind`, in their order."""
+     return tuple(server for server in configured if server.kind == kind)
+diff --git a/src/tools/prune_checkpoints.py b/src/tools/prune_checkpoints.py
+index 2210e07..8a037aa 100644
+--- a/src/tools/prune_checkpoints.py
++++ b/src/tools/prune_checkpoints.py
+@@ -13,14 +13,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+ # which would delete the checkpoints of packets it simply could not see.
+ load_dotenv()
+ 
+-from src.utils.paths import CHECKPOINT_DB_PATH, LOCAL_CASESHEETS_DIR, REPO_ROOT  # noqa: E402
++from src.utils.paths import CHECKPOINT_DB_PATH, LOCAL_CASESHEETS_DIR  # noqa: E402
+ 
+ def main():
+     parser = argparse.ArgumentParser(description="Prune LangGraph checkpoints for completed packets.")
+     parser.add_argument("--dry-run", action="store_true", help="Print what would be deleted without actually deleting")
+     args = parser.parse_args()
+ 
+-    base_dir = REPO_ROOT
+     db_path = CHECKPOINT_DB_PATH
+ 
+     if not db_path.exists():
+diff --git a/src/utils/outcomes.py b/src/utils/outcomes.py
+index 5dceb51..73d6ffc 100644
+--- a/src/utils/outcomes.py
++++ b/src/utils/outcomes.py
+@@ -22,7 +22,6 @@ from src.models.unified_casebook import as_unified
+ from src.storage.base import OUTCOME_VERDICTS
+ from src.storage.factory import get_casebook_storage
+ from src.utils.logging_config import get_logger
+-from src.utils.paths import casebook_dir
+ from src.utils.service_registry import PRE_REGISTRY_PACK
+ 
+ logger = get_logger(__name__)
+@@ -47,10 +46,6 @@ class InvalidVerdictError(Exception):
+     """The verdict is not one of OUTCOME_VERDICTS."""
+ 
+ 
+-def outcome_path(event_id: str):
+-    return casebook_dir(event_id) / OUTCOME_FILENAME
+-
+-
+ def _provenance_doc(provenance: dict) -> dict:
+     """The casebook's reason-code document record, or an empty dict.
+ 
+diff --git a/src/utils/prompt_store.py b/src/utils/prompt_store.py
+index 9605697..bbf486a 100644
+--- a/src/utils/prompt_store.py
++++ b/src/utils/prompt_store.py
+@@ -172,11 +172,6 @@ def _entry_for(path) -> Optional[PromptFile]:
+     return None
+ 
+ 
+-def is_prompt(path) -> bool:
+-    """Whether `path` is one of the catalog's prompt files."""
+-    return _entry_for(path) is not None
+-
+-
+ # ---------------------------------------------------------------------------
+ # The checks
+ # ---------------------------------------------------------------------------
+diff --git a/src/utils/runbook_store.py b/src/utils/runbook_store.py
+index 275114a..d712f4c 100644
+--- a/src/utils/runbook_store.py
++++ b/src/utils/runbook_store.py
+@@ -271,7 +271,7 @@ def get_runbook(service: str, reason_code: str, enrolment_type: str) -> Optional
+ 
+         try:
+             target_path = _resolve_runbook_path(r_code, e_type, directory)
+-        except ValueError as e:
++        except ValueError:
+             logger.info("Runbook miss", service=service, reason_code=r_code, enrolment_type=e_type, miss_reason="invalid_key")
+             continue
+ 
+diff --git a/src/utils/s3_uploader.py b/src/utils/s3_uploader.py
+deleted file mode 100644
+index 86dab60..0000000
+--- a/src/utils/s3_uploader.py
++++ /dev/null
+@@ -1,70 +0,0 @@
+-import os
+-import threading
+-from typing import Optional
+-import boto3
+-from botocore.exceptions import ClientError
+-
+-from src.utils.logging_config import get_logger
+-
+-logger = get_logger(__name__)
+-
+-# Cached across uploads: constructing a boto3 client resolves credentials and
+-# builds a signer every time, which is wasted work per packet (F20).
+-_s3_client = None
+-_s3_client_lock = threading.Lock()
+-
+-
+-def _get_s3_client():
+-    global _s3_client
+-    with _s3_client_lock:
+-        if _s3_client is None:
+-            endpoint = os.environ.get("S3_ENDPOINT_URL") or os.environ.get("AWS_ENDPOINT_URL")
+-            kwargs = {}
+-            if endpoint:
+-                from botocore.config import Config
+-                kwargs["endpoint_url"] = endpoint
+-                kwargs["config"] = Config(s3={"addressing_style": "path"})
+-                if os.environ.get("S3_VERIFY_SSL", "true").lower() == "false":
+-                    kwargs["verify"] = False
+-            _s3_client = boto3.client("s3", **kwargs)
+-        return _s3_client
+-
+-
+-def upload_logs_to_s3(event_id: str, logs: str) -> Optional[str]:
+-    """
+-    Uploads raw logs to AWS S3 and returns the S3 URL, or None if the
+-    upload could not happen (bucket not configured, or the upload failed).
+-
+-    Callers must check for None rather than storing the return value
+-    directly -- this previously returned a fake s3://mock-bucket/... URL (or
+-    an "S3 Upload Failed: ..." string) that got persisted in the casebook as
+-    if it were a real, resolvable link while the actual log text was
+-    discarded (1.12).
+-    """
+-    log = logger.bind(event_id=event_id)
+-    bucket_name = os.environ.get("S3_LOGS_BUCKET") or os.environ.get("CASEBOOK_S3_BUCKET")
+-
+-    if not bucket_name:
+-        log.info("S3_LOGS_BUCKET not configured; cannot upload logs.")
+-        return None
+-
+-    try:
+-        file_key = f"logs/{event_id}/raw_elastic_logs.txt"
+-
+-        _get_s3_client().put_object(
+-            Bucket=bucket_name,
+-            Key=file_key,
+-            Body=logs.encode('utf-8'),
+-            ContentType="text/plain"
+-        )
+-
+-        s3_url = f"s3://{bucket_name}/{file_key}"
+-        log.info("Logs uploaded to S3", s3_url=s3_url)
+-        return s3_url
+-
+-    except ClientError as e:
+-        log.error("Failed to upload logs to S3", error=str(e))
+-        return None
+-    except Exception as e:
+-        log.error("Unexpected S3 upload error", error=str(e))
+-        return None
+diff --git a/tests/test_phase1_fixes.py b/tests/test_phase1_fixes.py
+index ecbe962..d6327ca 100644
+--- a/tests/test_phase1_fixes.py
++++ b/tests/test_phase1_fixes.py
+@@ -229,13 +229,6 @@ def test_branch_on_error_caps_trailing_window(monkeypatch):
+ # 1.12 -- S3 upload failures must not silently discard the evidence.
+ # ======================================================================
+ 
+-def test_upload_logs_to_s3_returns_none_when_unconfigured(monkeypatch):
+-    monkeypatch.delenv("S3_LOGS_BUCKET", raising=False)
+-    from src.utils.s3_uploader import upload_logs_to_s3
+-
+-    assert upload_logs_to_s3("evt", "some logs") is None
+-
+-
+ def test_routes_cite_the_log_artifact_when_s3_unset(monkeypatch):
+     monkeypatch.delenv("S3_LOGS_BUCKET", raising=False)
+     event_id = "phase1-s3-fallback"
+diff --git a/tests/test_phase_d_fixes.py b/tests/test_phase_d_fixes.py
+index 54dbb29..fd8707f 100644
+--- a/tests/test_phase_d_fixes.py
++++ b/tests/test_phase_d_fixes.py
+@@ -31,8 +31,6 @@ def casesheets(tmp_path, monkeypatch):
+     from src.storage.local import LocalFilesystemCasebookStorage
+ 
+     monkeypatch.setattr("src.utils.paths.LOCAL_CASESHEETS_DIR", tmp_path)
+-    monkeypatch.setattr(outcomes, "casebook_dir",
+-                        lambda event_id: tmp_path / f"casebook_{event_id}")
+ 
+     storage = LocalFilesystemCasebookStorage(base_dir=str(tmp_path))
+     monkeypatch.setattr(outcomes, "get_casebook_storage", lambda: storage)
+@@ -331,19 +329,6 @@ def test_es_client_is_reused_across_fetches(monkeypatch):
+ # F20, F21, F22
+ # ======================================================================
+ 
+-def test_s3_client_is_cached(monkeypatch):
+-    from src.utils import s3_uploader
+-
+-    monkeypatch.setattr(s3_uploader, "_s3_client", None)
+-    monkeypatch.setenv("S3_LOGS_BUCKET", "some-bucket")
+-
+-    with patch.object(s3_uploader, "boto3") as mock_boto3:
+-        s3_uploader.upload_logs_to_s3("evt-1", "logs")
+-        s3_uploader.upload_logs_to_s3("evt-2", "logs")
+-
+-    assert mock_boto3.client.call_count == 1
+-
+-
+ def test_log_level_is_configurable(monkeypatch):
+     from src.utils import logging_config
+ 
