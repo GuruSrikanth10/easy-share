@@ -1,0 +1,354 @@
+diff --git a/.env.example b/.env.example
+index e344e2e..d7beadd 100644
+--- a/.env.example
++++ b/.env.example
+@@ -620,10 +620,14 @@ CHECKPOINT_BACKEND=sqlite
+ # Required when CHECKPOINT_BACKEND=postgres. Needs langgraph-checkpoint-postgres.
+ CHECKPOINT_POSTGRES_URI=
+ # Required when CHECKPOINT_BACKEND=mysql (langgraph-checkpoint-mysql ships in
+-# the image). MySQL >= 8.0.19 or MariaDB >= 10.7.1; the user needs SELECT,
+-# INSERT, UPDATE, DELETE, CREATE, ALTER and INDEX, and the first start creates
+-# four checkpoint* tables. The password is not URL-decoded, so it cannot
+-# contain / ? or #. A connection MySQL has closed is replaced.
++# the image). MySQL >= 8.0.19 or MariaDB >= 10.7.1. It only connects: the
++# checkpoints, checkpoint_blobs and checkpoint_writes tables must already
++# exist -- another app's may be shared -- and it never creates or alters a
++# table, refusing to start when they lack a column it writes. For an empty
++# database, create them once with langgraph-checkpoint-mysql's own setup().
++# The user needs SELECT, INSERT, UPDATE and DELETE. The password is not
++# URL-decoded, so it cannot contain / ? or #. A connection MySQL has closed
++# is replaced.
+ # e.g. mysql://user:password@host:3306/agentic_crm_checkpoints
+ CHECKPOINT_MYSQL_URI=
+ # Required when CASEBOOK_STORAGE_BACKEND=s3, or when a reduced log payload
+diff --git a/ARCHITECTURE.md b/ARCHITECTURE.md
+index 08b95a5..374f562 100644
+--- a/ARCHITECTURE.md
++++ b/ARCHITECTURE.md
+@@ -1908,7 +1908,7 @@ The architecture incorporates several resilience mechanisms to prevent runaway c
+ - **Log Reduction Pipeline (`src/log_pipeline/`, section 3.6)**: Fetched logs are no longer dumped raw into the LLM context. Instead, they pass through a production-grade pipeline: Stage 1 (source-filtered fetch with `search_after` and an `_id` tiebreaker for broad ES version compatibility, a hard `LOG_MAX_DOCUMENTS` cap, TLS verification on by default (`ES_VERIFY_CERTS`), and local Kibana CSV mock support via `ES_MOCK_FILE` for offline testing), Stage 2 (branch on ERROR -- stuck packets skip clustering, with both a leading *and* trailing context window so a cascading failure can't pull in the entire trace), Stage 2.5 (a severity floor and SQL-column collapse applied only to the model's copy), Stage 3 (Drain3 clustering with file-persisted state for stable template IDs, held as a process-wide `TemplateMiner` singleton so the state file is only read/deserialized once per process rather than per packet, serialized by a thread lock + cross-process `FileLock` so concurrent packets can't corrupt the shared parse tree, and scoped to emit only the clusters this call's own logs actually matched -- never another packet's templates), and Stage 4 (evidence assembly guardrails enforcing decision-vocabulary regex matches, rare-template retention, and flow-boundary context, each bounded so an exemption cannot make the output larger than its input). An offline Stage 0 catalog (`build_catalog.py`) classifies templates as boilerplate/informative/decision-marker and flags an implausibly high boilerplate share, and a Stage 6 eval harness (`eval_harness.py`) validates pipeline accuracy before production use.
+ - **Pluggable Log Sources (`src/log_pipeline/sources/`)**: Stage 1 sits behind a `LogSource` Protocol (mirroring `CasebookStorage`), so Stages 2-4 are source-agnostic -- any source emitting the canonical `LogRecord` (`timestamp`/`level`/`message`/`app_name`, defined in `src/log_pipeline/types.py`) works with Drain3 clustering, the guardrails, the S3 offload, and the casebook wiring unchanged. `ElasticLogSource` wraps the existing fetcher without modifying it, so the `ES_MOCK_FILE` CSV workflow is unchanged. See section 3.10 for the Kubernetes log source and the fallback chain architecture.
+ - **Decoupled Fetch/Analyze Consumers, Bounded Concurrency, & At-Least-Once Delivery**: `fast_consumer.py` and `slow_consumer.py` (both thin entry points over `src/utils/kafkaConsumer.py`, selected by `CONSUMER_ROLE`; section 3.11) each isolate their own Kafka polling loop and submit tasks to a `ThreadPoolExecutor` bounded by a `Semaphore` (`MAX_CONCURRENT_INVESTIGATIONS`, sized independently per process). The poll loop never waits for a worker slot: messages fetched while every worker is busy queue in a backlog, the consumer's partitions are paused until it drains, and `poll()` keeps running every `SATURATED_POLL_SECONDS` (1; `IDLE_POLL_SECONDS`, 5, when nothing is waiting), so a rebalance and a SIGTERM are answered within a second whatever the workers are doing. It used to stop polling until a slot freed, and kafka-python completes a group rebalance only inside `poll()`, so one rebalance stalled the whole group for 9.5 minutes (2026-09-29). To guarantee At-Least-Once delivery and prevent consumer rebalances during slow AI processing, each consumer is configured with `KAFKA_MAX_POLL_RECORDS` and a high `KAFKA_MAX_POLL_INTERVAL_MS`. Offsets are never committed immediately upon dispatch; instead, an `OffsetTracker` records completions and each poll cycle commits only the safe low-water mark -- the highest offset below which every dispatched message on that partition has completed -- so a batch that finishes out of order can never commit past one still in flight. If a crash or 429 error occurs, the offset is not marked complete, and Kafka safely redelivers the packet.
+-- **DLQ, Poison-pill, & Checkpointing**: LangGraph checkpoints through `src/core/checkpointer.py`, selected by `CHECKPOINT_BACKEND`: `SqliteSaver` (WAL mode enabled) by default, or a shared `PostgresSaver`/`PyMySQLSaver` when running more than one replica -- `mysql` exists for organisations without Postgres support, and keeps the checkpoints off the pod's ephemeral disk. The MySQL saver (`core/mysql_saver.py`) replaces its connection when MySQL has closed it (idle past `wait_timeout`, a restart), and `/ready` runs a query through it. Structurally invalid Kafka messages (poison-pills) and unrecoverable pipeline crashes are immediately published to a Dead Letter Queue (`rejected-packets-dlq`) via `dlq_publisher.py`.
++- **DLQ, Poison-pill, & Checkpointing**: LangGraph checkpoints through `src/core/checkpointer.py`, selected by `CHECKPOINT_BACKEND`: `SqliteSaver` (WAL mode enabled) by default, or a shared `PostgresSaver`/`PyMySQLSaver` when running more than one replica -- `mysql` exists for organisations without Postgres support, and keeps the checkpoints off the pod's ephemeral disk. The MySQL saver (`core/mysql_saver.py`) replaces its connection when MySQL has closed it (idle past `wait_timeout`, a restart), and `/ready` runs a query through it. It only connects, to checkpoint tables that already exist -- possibly another application's, whose thread ids never match this app's event ids -- and never runs the library's `setup()`, which migrates tables as if it had made them: a first start had run ALTER TABLE on another application's tables, then failed on their existing index. Instead it checks, reading only, that the tables have every column it writes, and refuses to start, changing nothing, when they do not. Structurally invalid Kafka messages (poison-pills) and unrecoverable pipeline crashes are immediately published to a Dead Letter Queue (`rejected-packets-dlq`) via `dlq_publisher.py`.
+ - **Pipeline Timeouts**: `PACKET_TIMEOUT_SECONDS` bounds the **slow consumer's HTTP client** waiting on `/analyze-rejection` -- the LLM investigation budget, same variable and meaning this had before the fetch/analyze split. The fast consumer gets its own, much shorter `FAST_CONSUMER_TIMEOUT_SECONDS` for the bounded `/fetch-logs` call. The API side is independently bounded too: `routes.py` runs `agent.invoke()` (from `/analyze-rejection` or `/process-rejection`) on a dedicated executor thread with its own budget (`AGENT_INVOKE_TIMEOUT_SECONDS`, defaulting to `PACKET_TIMEOUT_SECONDS - 30s`) so the server is authoritative about its own failure and returns `FAILED_TIMEOUT` before the consumer's deadline fires. That 200 commits the offset and `FAILED_TIMEOUT` is terminal, so the route also dead-letters the packet; without it a timed-out packet existed nowhere replayable (2026-09-29: 21 timeouts, none dead-lettered). **The abandoned run is cancelled** (`src/core/run_control.py`). A Python thread cannot be interrupted, so the route sets the run's cancellation event and the run stops itself: every agent carries `CancellationMiddleware`, which refuses its next model call and next tool call; the graph refuses to start another node (`stoppable`); and `queue_for_replay` checks again, since a replay is the one side effect that reaches outside this system. The model call already in flight still finishes, but the worker is free within one call instead of at the end of the graph -- on 2026-09-29 abandoned runs held every worker, and the next batch timed out without starting. `RunCancelled` is not retried and never counts towards opening `llm_breaker`, and a done-callback logs how each abandoned run ended. `/fetch-logs` has no equivalent dedicated executor -- it's bounded I/O (`K8S_TOTAL_FETCH_TIMEOUT_SECONDS`, `ES_REQUEST_TIMEOUT_SECONDS`), not a multi-minute LLM call, so it runs on Starlette's own sync-dispatch threadpool like `/health`/`/ready`. Both the LLM clients (`LLM_TIMEOUT_SECONDS`, `max_retries=0`) and `agent.invoke` are bounded. If a terminal `FAILED_TIMEOUT`/`DLQ` status is already recorded by the time a slow invocation finally returns, that late result is discarded rather than overwriting it.
+ - **Human-in-the-Loop Replays**: Agents cannot fire destructive API requests directly. Unless `ENABLE_AUTO_REPLAY=true`, replay actions invoked by the LLM are queued for an operator to approve via `approve_replays.py`. The queue is **one document per packet id** under the `pending_replays` storage root (`get_scoped_storage`), not the `src/db/pending_replays.jsonl` file it used to be: that file lived on whichever pod happened to write it, so under `CASEBOOK_STORAGE_BACKEND=s3` with more than one replica an operator saw only their own pod's entries and the rest were invisible indefinitely. `approve_replays.py` still drains any leftover local jsonl for backwards compatibility. Both the auto-replay call and `approve_replays.py` send the replay payload as an authenticated (`OIS_API_KEY`) JSON body rather than query params, so PII like `notificationEmail`/`notificationMobile` doesn't land in server access logs. The packet id is pattern-guarded (`EVENT_ID_PATTERN`) before it is interpolated into a storage path.
+ - **Safe Self-Learning & Drift Checks**: The Reviewer's `add_learning_rule` tool stages suggestions to `src/prompts/pending_rules.jsonl` using `filelock`. A human runs `src/tools/promote_rules.py` (which includes top-level locking and git-status safety checks) to approve the rules -- committing them is opt-in (`--commit`), so promoting and committing stay separate decisions; only promoted entries are removed from the pending file, so skipped/errored/concurrently-appended entries survive. Additionally, `src/tools/check_drift.py` detects database schema/policy drift, and distinguishes a genuinely changed schema from a malformed single-column CSV export.
+diff --git a/src/core/checkpointer.py b/src/core/checkpointer.py
+index 67f8959..9f16491 100644
+--- a/src/core/checkpointer.py
++++ b/src/core/checkpointer.py
+@@ -146,13 +146,15 @@ def _build_mysql():
+ 
+     # On its own connection, not `PyMySQLSaver.from_conn_string`: that is a
+     # context manager, and entering it and dropping it closed the connection
+-    # before setup() ran, so this backend failed on its first query
+-    # (2026-11-20). The saver also replaces the connection once MySQL has
+-    # closed it (core/mysql_saver.py).
++    # before its first query, so this backend never worked (2026-11-20). The
++    # saver also replaces the connection once MySQL has closed it
++    # (core/mysql_saver.py).
+     checkpointer = ReconnectingPyMySQLSaver(uri)
+ 
+-    # Idempotent; creates the checkpoint tables on first run.
+-    checkpointer.setup()
++    # Connects only, to tables that already exist: setup() is never run here,
++    # since it migrates the tables as if this app had made them
++    # (`ReconnectingPyMySQLSaver.check_tables`). Reads only.
++    checkpointer.check_tables()
+     logger.info("Checkpointer ready", backend="mysql")
+     return checkpointer
+ 
+diff --git a/src/core/mysql_saver.py b/src/core/mysql_saver.py
+index bdab66e..6aa97dd 100644
+--- a/src/core/mysql_saver.py
++++ b/src/core/mysql_saver.py
+@@ -16,11 +16,35 @@ same, but pymysql 1.2 deprecates it.
+ Imported only by `checkpointer._build_mysql`, so a sqlite or postgres
+ deployment never loads langgraph-checkpoint-mysql.
+ """
++import importlib.metadata
++import re
+ from contextlib import contextmanager
+ 
+ import pymysql
+ from langgraph.checkpoint.mysql.pymysql import PyMySQLSaver
+ 
++#: The columns this saver writes, per table: the column lists of
++#: langgraph-checkpoint-mysql's INSERT statements, which also cover every
++#: column it reads (tests/test_mysql_checkpointer.py checks them against the
++#: installed version). The existing tables are used only if they have all of
++#: them.
++REQUIRED_COLUMNS = {
++    "checkpoints": ("thread_id", "checkpoint_ns", "checkpoint_ns_hash", "checkpoint_id",
++                    "parent_checkpoint_id", "checkpoint", "metadata"),
++    "checkpoint_blobs": ("thread_id", "checkpoint_ns", "checkpoint_ns_hash", "channel",
++                         "version", "type", "blob"),
++    "checkpoint_writes": ("thread_id", "checkpoint_ns", "checkpoint_ns_hash", "checkpoint_id",
++                          "task_id", "task_path", "idx", "channel", "type", "blob"),
++}
++
++#: A computed column, which refuses the value this saver writes into
++#: `checkpoint_ns_hash`. `DEFAULT_GENERATED` (an expression default) is not one.
++_GENERATED = re.compile(r"\b(VIRTUAL|STORED|PERSISTENT) GENERATED\b", re.IGNORECASE)
++
++
++class CheckpointTablesError(RuntimeError):
++    """The checkpoint tables cannot take what this saver writes."""
++
+ 
+ class ReconnectingPyMySQLSaver(PyMySQLSaver):
+     """`PyMySQLSaver` that reconnects when MySQL has closed its connection."""
+@@ -30,8 +54,8 @@ class ReconnectingPyMySQLSaver(PyMySQLSaver):
+         super().__init__(self._connect())
+ 
+     def _connect(self) -> pymysql.Connection:
+-        # autocommit as `from_conn_string` sets it: `setup()` and every query
+-        # outside a pipeline rely on it.
++        # autocommit as `from_conn_string` sets it: every query outside a
++        # pipeline relies on it.
+         return pymysql.connect(**self._connect_kwargs, autocommit=True)
+ 
+     @contextmanager
+@@ -57,9 +81,53 @@ class ReconnectingPyMySQLSaver(PyMySQLSaver):
+             pass  # Already closed, which is why it is being replaced.
+         self.conn = self._connect()
+ 
++    def check_tables(self) -> None:
++        """Check, only reading, that the checkpoint tables can take this
++        saver's rows. Raises `CheckpointTablesError` when they cannot.
++
++        This app connects to tables that already exist, and never runs
++        `setup()`: it migrates the tables as if it had made them, and on
++        2026-11-20 it ran ALTER TABLE on another application's
++        checkpoint_blobs, then failed on an index those tables already had
++        ("Duplicate key name 'checkpoints_thread_id_idx'"), on every start.
++        Sharing the tables is safe for the rows: every query names the
++        thread, and this app's thread ids are its event ids.
++        """
++        with self._cursor() as cur:
++            # Aliased: MySQL 8 labels information_schema columns in upper case.
++            cur.execute("SELECT table_name AS tbl, column_name AS col, extra AS extra "
++                        "FROM information_schema.columns WHERE table_schema = DATABASE()")
++            columns = {(row["tbl"], row["col"]): row["extra"] or "" for row in cur.fetchall()}
++        problems = _unusable(columns)
++        if problems:
++            raise CheckpointTablesError(
++                "The checkpoint tables in CHECKPOINT_MYSQL_URI's database cannot take "
++                "this app's rows (langgraph-checkpoint-mysql "
++                f"{importlib.metadata.version('langgraph-checkpoint-mysql')}): "
++                f"{'; '.join(problems)}. This app only connects to them; it never "
++                "creates or alters tables, and nothing was changed.")
++
+     def ping(self) -> None:
+         """Run a query, reconnecting first if MySQL closed the connection.
+         Raises when MySQL cannot be reached. For /ready
+         (`checkpointer.health_check`)."""
+         with self._cursor() as cur:
+             cur.execute("SELECT 1")
++
++
++def _unusable(columns: dict) -> list:
++    """Why the checkpoint tables cannot take this saver's rows, given
++    {(table, column): EXTRA} from information_schema; empty when they can."""
++    problems = []
++    for table, needed in REQUIRED_COLUMNS.items():
++        have = {column for (owner, column) in columns if owner == table}
++        if not have:
++            problems.append(f"there is no {table} table")
++            continue
++        missing = [column for column in needed if column not in have]
++        if missing:
++            problems.append(f"{table} has no {', '.join(missing)}")
++        if _GENERATED.search(columns.get((table, "checkpoint_ns_hash"), "")):
++            problems.append(f"{table}.checkpoint_ns_hash is a generated column, "
++                            "which cannot take the value this saver writes")
++    return problems
+diff --git a/tests/test_mysql_checkpointer.py b/tests/test_mysql_checkpointer.py
+index b107866..47c0d27 100644
+--- a/tests/test_mysql_checkpointer.py
++++ b/tests/test_mysql_checkpointer.py
+@@ -12,12 +12,19 @@ ever working:
+   (idle past `wait_timeout`, a restart), every packet failed, while
+   `health_check` kept reporting it healthy.
+ 
++And a third the same day: the database already held another application's
++checkpoint tables, which `setup()` migrated as if they were this app's -- an
++ALTER TABLE on them, then "Duplicate key name 'checkpoints_thread_id_idx'" on
++every start. The app now only connects: it never runs `setup()`, and checks,
++reading only, that the tables have every column it writes.
++
+ The unit tests stand in a fake connection for pymysql's. The last test runs
+ against a real MySQL when CHECKPOINT_TEST_MYSQL_URI names a database it may
+ create tables in, e.g. one from `docker run -p 127.0.0.1:3307:3306 mysql:8.4`.
+ """
+ import gc
+ import os
++import re
+ import sys
+ import time
+ import types
+@@ -26,13 +33,24 @@ from contextlib import contextmanager
+ import pymysql
+ import pytest
+ from langchain_core.messages import AIMessage, HumanMessage
++from langgraph.checkpoint.mysql import base as saver_sql
++from langgraph.checkpoint.mysql.pymysql import PyMySQLSaver
+ from langgraph.graph import START, MessagesState, StateGraph
+ 
+ from src.core import checkpointer
+-from src.core.mysql_saver import ReconnectingPyMySQLSaver
++from src.core.mysql_saver import (
++    REQUIRED_COLUMNS,
++    CheckpointTablesError,
++    ReconnectingPyMySQLSaver,
++)
+ 
+ URI = "mysql://su01:secret@db.example:3306/agentic_crm"
+ 
++#: Checkpoint tables with every column the saver writes, as they already
++#: exist -- another application's, say, with no checkpoint_migrations table.
++EXISTING_TABLES = {table: [(column, "") for column in columns]
++                   for table, columns in REQUIRED_COLUMNS.items()}
++
+ #: A real MySQL database the last test may create tables in; unset, it skips.
+ REAL_MYSQL_URI = os.environ.get("CHECKPOINT_TEST_MYSQL_URI", "")
+ 
+@@ -56,12 +74,19 @@ class FakeCursor:
+         return None
+ 
+     def fetchall(self):
++        if "information_schema.columns" in self.conn.queries[-1]:
++            return [{"tbl": table, "col": column, "extra": extra}
++                    for table, columns in self.conn.schema.items()
++                    for column, extra in columns]
+         return []
+ 
+ 
+ class FakeConnection:
+     """pymysql's connection, as far as the saver and the ping use it."""
+ 
++    #: What the database already holds: {table: [(column, EXTRA), ...]}.
++    schema: dict = {}
++
+     def __init__(self, kwargs):
+         self.kwargs = kwargs
+         self.queries = []
+@@ -93,8 +118,9 @@ class FakeConnection:
+ 
+ @pytest.fixture
+ def mysql(monkeypatch):
+-    """CHECKPOINT_BACKEND=mysql on fake connections; yields the list of them,
+-    in the order they were opened."""
++    """CHECKPOINT_BACKEND=mysql on fake connections, to a database that
++    already holds the checkpoint tables; yields the connections, in the order
++    they were opened."""
+     connections = []
+ 
+     def connect(**kwargs):
+@@ -103,6 +129,7 @@ def mysql(monkeypatch):
+         return connection
+ 
+     monkeypatch.setattr(pymysql, "connect", connect)
++    monkeypatch.setattr(FakeConnection, "schema", EXISTING_TABLES)
+     monkeypatch.setenv("CHECKPOINT_BACKEND", "mysql")
+     monkeypatch.setenv("CHECKPOINT_MYSQL_URI", URI)
+     checkpointer.reset_checkpointer()
+@@ -110,7 +137,11 @@ def mysql(monkeypatch):
+     checkpointer.reset_checkpointer()
+ 
+ 
+-def test_the_mysql_checkpointer_keeps_its_connection_and_sets_up(mysql):
++def _schema_changes(connection) -> list:
++    return [q for q in connection.queries if q.startswith(("CREATE", "ALTER", "INSERT", "DROP"))]
++
++
++def test_the_mysql_checkpointer_keeps_its_connection_and_only_reads(mysql):
+     saver = checkpointer.get_checkpointer()
+     gc.collect()
+ 
+@@ -120,9 +151,70 @@ def test_the_mysql_checkpointer_keeps_its_connection_and_sets_up(mysql):
+     assert connection.kwargs == {"host": "db.example", "port": 3306, "user": "su01",
+                                  "password": "secret", "database": "agentic_crm",
+                                  "unix_socket": None, "autocommit": True}
+-    created = [q for q in connection.queries if q.startswith("CREATE TABLE IF NOT EXISTS")]
+-    assert {q.split()[5] for q in created} == {"checkpoint_migrations", "checkpoints",
+-                                               "checkpoint_blobs", "checkpoint_writes"}
++    assert any("information_schema.columns" in q for q in connection.queries)
++    assert _schema_changes(connection) == []
++
++
++def test_it_connects_without_running_setup(mysql, monkeypatch):
++    """Not even beside a checkpoint_migrations table, which a failed start
++    left in a database another application's tables are in."""
++    monkeypatch.setattr(FakeConnection, "schema",
++                        {**EXISTING_TABLES, "checkpoint_migrations": [("v", "")],
++                         "tickets": [("id", "")]})
++
++    def setup(self):
++        raise AssertionError("setup() ran")
++
++    monkeypatch.setattr(ReconnectingPyMySQLSaver, "setup", setup)
++    saver = checkpointer.get_checkpointer()
++    saver.delete_thread("evt-1")
++
++    assert _schema_changes(mysql[0]) == []
++    assert any(q.startswith("DELETE FROM checkpoints WHERE thread_id") for q in mysql[0].queries)
++
++
++def test_tables_without_a_column_it_writes_are_refused(mysql, monkeypatch):
++    schema = dict(EXISTING_TABLES)
++    schema["checkpoint_writes"] = [c for c in schema["checkpoint_writes"] if c[0] != "task_path"]
++    monkeypatch.setattr(FakeConnection, "schema", schema)
++
++    with pytest.raises(CheckpointTablesError, match="checkpoint_writes has no task_path"):
++        checkpointer.get_checkpointer()
++
++    assert _schema_changes(mysql[0]) == []
++
++
++def test_a_generated_namespace_hash_is_refused(mysql, monkeypatch):
++    """The saver writes checkpoint_ns_hash itself, which a computed column refuses."""
++    schema = dict(EXISTING_TABLES)
++    schema["checkpoints"] = [(c, "STORED GENERATED" if c == "checkpoint_ns_hash" else "")
++                             for c, _ in schema["checkpoints"]]
++    monkeypatch.setattr(FakeConnection, "schema", schema)
++
++    with pytest.raises(CheckpointTablesError,
++                       match="checkpoints.checkpoint_ns_hash is a generated column"):
++        checkpointer.get_checkpointer()
++
++
++def test_missing_tables_are_refused_not_created(mysql, monkeypatch):
++    monkeypatch.setattr(FakeConnection, "schema", {"tickets": [("id", "")]})
++
++    with pytest.raises(CheckpointTablesError, match="there is no checkpoints table"):
++        checkpointer.get_checkpointer()
++
++    assert _schema_changes(mysql[0]) == []
++
++
++def test_the_required_columns_are_the_ones_the_saver_writes():
++    """Kept in step with the installed langgraph-checkpoint-mysql: its INSERT
++    statements name every column it writes, and its reads use no others."""
++    written: dict = {}
++    for name in ("UPSERT_CHECKPOINTS_SQL", "UPSERT_CHECKPOINT_BLOBS_SQL",
++                 "UPSERT_CHECKPOINT_WRITES_SQL", "INSERT_CHECKPOINT_WRITES_SQL"):
++        table, columns = re.search(r"INTO (\w+) \(([^)]*)\)", getattr(saver_sql, name)).groups()
++        written.setdefault(table, set()).update(c.strip(" `") for c in columns.split(","))
++
++    assert written == {table: set(columns) for table, columns in REQUIRED_COLUMNS.items()}
+ 
+ 
+ def test_a_live_connection_is_kept(mysql):
+@@ -210,6 +302,10 @@ def _graph(saver):
+ @pytest.mark.skipif(not REAL_MYSQL_URI,
+                     reason="set CHECKPOINT_TEST_MYSQL_URI to a MySQL database it may write to")
+ def test_against_a_real_mysql(monkeypatch):
++    # The tables exist before the app connects, as whoever owns them made them.
++    with PyMySQLSaver.from_conn_string(REAL_MYSQL_URI) as owner:
++        owner.setup()
++
+     monkeypatch.setenv("CHECKPOINT_BACKEND", "mysql")
+     monkeypatch.setenv("CHECKPOINT_MYSQL_URI", REAL_MYSQL_URI)
+     checkpointer.reset_checkpointer()
