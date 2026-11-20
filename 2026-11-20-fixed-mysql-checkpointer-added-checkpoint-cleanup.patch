@@ -1,0 +1,811 @@
+diff --git a/.env.example b/.env.example
+index b261f03..e344e2e 100644
+--- a/.env.example
++++ b/.env.example
+@@ -613,12 +613,18 @@ API_REPLICA_COUNT=1
+ # LangGraph checkpoint store: 'sqlite' (local file), 'postgres' (shared), or
+ # 'mysql' (shared -- for organisations without Postgres support).
+ # A local SQLite file cannot be shared between pods, so a packet checkpointed
+-# by one replica cannot be resumed by another.
++# by one replica cannot be resumed by another. On Kubernetes it also sits in
++# the container's writable layer, which counts toward ephemeral storage.
++# Either way a packet's checkpoints are deleted once it is terminal.
+ CHECKPOINT_BACKEND=sqlite
+ # Required when CHECKPOINT_BACKEND=postgres. Needs langgraph-checkpoint-postgres.
+ CHECKPOINT_POSTGRES_URI=
+-# Required when CHECKPOINT_BACKEND=mysql. Needs langgraph-checkpoint-mysql.
+-# e.g. mysql+pymysql://user:password@host:3306/agentic_crm_checkpoints
++# Required when CHECKPOINT_BACKEND=mysql (langgraph-checkpoint-mysql ships in
++# the image). MySQL >= 8.0.19 or MariaDB >= 10.7.1; the user needs SELECT,
++# INSERT, UPDATE, DELETE, CREATE, ALTER and INDEX, and the first start creates
++# four checkpoint* tables. The password is not URL-decoded, so it cannot
++# contain / ? or #. A connection MySQL has closed is replaced.
++# e.g. mysql://user:password@host:3306/agentic_crm_checkpoints
+ CHECKPOINT_MYSQL_URI=
+ # Required when CASEBOOK_STORAGE_BACKEND=s3, or when a reduced log payload
+ # is too large to embed inline in the casebook. Left unset, oversized logs
+diff --git a/ARCHITECTURE.md b/ARCHITECTURE.md
+index f00927a..08b95a5 100644
+--- a/ARCHITECTURE.md
++++ b/ARCHITECTURE.md
+@@ -626,6 +626,19 @@ flowchart TD
+ > savers) when it holds a finished run's values, then invokes. A run that stopped
+ > part-way still resumes from its checkpoint.
+ 
++> **A finished packet's checkpoints are deleted, and the agents write none
++> (2026-11-20).** Pods were evicted for exceeding their ephemeral-storage limit.
++> Each deep agent, compiled without a checkpointer, inherited the graph's, and
++> the SQLite saver stored the whole state -- the prompt with its logs -- at every
++> one of the agent's internal steps: 0.9-3.2 MiB a packet in `checkpoints.db`, in
++> the container's writable layer, never deleted. `build_agent` now passes
++> `checkpointer=False`, so only the graph checkpoints, between nodes; a crashed
++> run resumes at the agent's node and runs that agent again. The route deletes
++> the packet's thread (`routes._discard_checkpoints`) once the packet is
++> terminal: after its casebook is saved, on the DLQ path, when a late result is
++> discarded, and, for a run past its budget, once that run has stopped. A
++> `FAILED_SHUTDOWN` packet keeps them, for its redelivery to resume.
++
+ > **A packet the API shut down on is investigated again when it is redelivered.**
+ > The drain records `FAILED_SHUTDOWN` -- terminal, so nothing waits on it as
+ > `IN_PROGRESS` -- with the time it abandoned the run (`abandoned_at`). The packet's
+@@ -848,6 +861,7 @@ agentic-resident-crm/
+ │   │   ├── rejection_context.py    # The direct lane's three prompts, in a fixed order, under
+ │   │   │                           #   REJECTION_PROMPT_MAX_CHARS (logs trimmed, nothing else)
+ │   │   ├── checkpointer.py         # Checkpointer backend: sqlite (default), postgres, or mysql
++│   │   ├── mysql_saver.py          # The mysql saver, replacing a connection MySQL has closed
+ │   │   └── run_control.py          # Cancels a run the API stopped waiting for: its next model call,
+ │   │                               #   tool call or graph node raises RunCancelled
+ │   ├── dlt/                        # Dead-letter topic analysis (parallel flow; see DLT_PLAN.md)
+@@ -1894,7 +1908,7 @@ The architecture incorporates several resilience mechanisms to prevent runaway c
+ - **Log Reduction Pipeline (`src/log_pipeline/`, section 3.6)**: Fetched logs are no longer dumped raw into the LLM context. Instead, they pass through a production-grade pipeline: Stage 1 (source-filtered fetch with `search_after` and an `_id` tiebreaker for broad ES version compatibility, a hard `LOG_MAX_DOCUMENTS` cap, TLS verification on by default (`ES_VERIFY_CERTS`), and local Kibana CSV mock support via `ES_MOCK_FILE` for offline testing), Stage 2 (branch on ERROR -- stuck packets skip clustering, with both a leading *and* trailing context window so a cascading failure can't pull in the entire trace), Stage 2.5 (a severity floor and SQL-column collapse applied only to the model's copy), Stage 3 (Drain3 clustering with file-persisted state for stable template IDs, held as a process-wide `TemplateMiner` singleton so the state file is only read/deserialized once per process rather than per packet, serialized by a thread lock + cross-process `FileLock` so concurrent packets can't corrupt the shared parse tree, and scoped to emit only the clusters this call's own logs actually matched -- never another packet's templates), and Stage 4 (evidence assembly guardrails enforcing decision-vocabulary regex matches, rare-template retention, and flow-boundary context, each bounded so an exemption cannot make the output larger than its input). An offline Stage 0 catalog (`build_catalog.py`) classifies templates as boilerplate/informative/decision-marker and flags an implausibly high boilerplate share, and a Stage 6 eval harness (`eval_harness.py`) validates pipeline accuracy before production use.
+ - **Pluggable Log Sources (`src/log_pipeline/sources/`)**: Stage 1 sits behind a `LogSource` Protocol (mirroring `CasebookStorage`), so Stages 2-4 are source-agnostic -- any source emitting the canonical `LogRecord` (`timestamp`/`level`/`message`/`app_name`, defined in `src/log_pipeline/types.py`) works with Drain3 clustering, the guardrails, the S3 offload, and the casebook wiring unchanged. `ElasticLogSource` wraps the existing fetcher without modifying it, so the `ES_MOCK_FILE` CSV workflow is unchanged. See section 3.10 for the Kubernetes log source and the fallback chain architecture.
+ - **Decoupled Fetch/Analyze Consumers, Bounded Concurrency, & At-Least-Once Delivery**: `fast_consumer.py` and `slow_consumer.py` (both thin entry points over `src/utils/kafkaConsumer.py`, selected by `CONSUMER_ROLE`; section 3.11) each isolate their own Kafka polling loop and submit tasks to a `ThreadPoolExecutor` bounded by a `Semaphore` (`MAX_CONCURRENT_INVESTIGATIONS`, sized independently per process). The poll loop never waits for a worker slot: messages fetched while every worker is busy queue in a backlog, the consumer's partitions are paused until it drains, and `poll()` keeps running every `SATURATED_POLL_SECONDS` (1; `IDLE_POLL_SECONDS`, 5, when nothing is waiting), so a rebalance and a SIGTERM are answered within a second whatever the workers are doing. It used to stop polling until a slot freed, and kafka-python completes a group rebalance only inside `poll()`, so one rebalance stalled the whole group for 9.5 minutes (2026-09-29). To guarantee At-Least-Once delivery and prevent consumer rebalances during slow AI processing, each consumer is configured with `KAFKA_MAX_POLL_RECORDS` and a high `KAFKA_MAX_POLL_INTERVAL_MS`. Offsets are never committed immediately upon dispatch; instead, an `OffsetTracker` records completions and each poll cycle commits only the safe low-water mark -- the highest offset below which every dispatched message on that partition has completed -- so a batch that finishes out of order can never commit past one still in flight. If a crash or 429 error occurs, the offset is not marked complete, and Kafka safely redelivers the packet.
+-- **DLQ, Poison-pill, & Checkpointing**: LangGraph checkpoints through `src/core/checkpointer.py`, selected by `CHECKPOINT_BACKEND`: `SqliteSaver` (WAL mode enabled) by default, or a shared `PostgresSaver`/`PyMySQLSaver` when running more than one replica -- `mysql` exists for organisations without Postgres support. Structurally invalid Kafka messages (poison-pills) and unrecoverable pipeline crashes are immediately published to a Dead Letter Queue (`rejected-packets-dlq`) via `dlq_publisher.py`.
++- **DLQ, Poison-pill, & Checkpointing**: LangGraph checkpoints through `src/core/checkpointer.py`, selected by `CHECKPOINT_BACKEND`: `SqliteSaver` (WAL mode enabled) by default, or a shared `PostgresSaver`/`PyMySQLSaver` when running more than one replica -- `mysql` exists for organisations without Postgres support, and keeps the checkpoints off the pod's ephemeral disk. The MySQL saver (`core/mysql_saver.py`) replaces its connection when MySQL has closed it (idle past `wait_timeout`, a restart), and `/ready` runs a query through it. Structurally invalid Kafka messages (poison-pills) and unrecoverable pipeline crashes are immediately published to a Dead Letter Queue (`rejected-packets-dlq`) via `dlq_publisher.py`.
+ - **Pipeline Timeouts**: `PACKET_TIMEOUT_SECONDS` bounds the **slow consumer's HTTP client** waiting on `/analyze-rejection` -- the LLM investigation budget, same variable and meaning this had before the fetch/analyze split. The fast consumer gets its own, much shorter `FAST_CONSUMER_TIMEOUT_SECONDS` for the bounded `/fetch-logs` call. The API side is independently bounded too: `routes.py` runs `agent.invoke()` (from `/analyze-rejection` or `/process-rejection`) on a dedicated executor thread with its own budget (`AGENT_INVOKE_TIMEOUT_SECONDS`, defaulting to `PACKET_TIMEOUT_SECONDS - 30s`) so the server is authoritative about its own failure and returns `FAILED_TIMEOUT` before the consumer's deadline fires. That 200 commits the offset and `FAILED_TIMEOUT` is terminal, so the route also dead-letters the packet; without it a timed-out packet existed nowhere replayable (2026-09-29: 21 timeouts, none dead-lettered). **The abandoned run is cancelled** (`src/core/run_control.py`). A Python thread cannot be interrupted, so the route sets the run's cancellation event and the run stops itself: every agent carries `CancellationMiddleware`, which refuses its next model call and next tool call; the graph refuses to start another node (`stoppable`); and `queue_for_replay` checks again, since a replay is the one side effect that reaches outside this system. The model call already in flight still finishes, but the worker is free within one call instead of at the end of the graph -- on 2026-09-29 abandoned runs held every worker, and the next batch timed out without starting. `RunCancelled` is not retried and never counts towards opening `llm_breaker`, and a done-callback logs how each abandoned run ended. `/fetch-logs` has no equivalent dedicated executor -- it's bounded I/O (`K8S_TOTAL_FETCH_TIMEOUT_SECONDS`, `ES_REQUEST_TIMEOUT_SECONDS`), not a multi-minute LLM call, so it runs on Starlette's own sync-dispatch threadpool like `/health`/`/ready`. Both the LLM clients (`LLM_TIMEOUT_SECONDS`, `max_retries=0`) and `agent.invoke` are bounded. If a terminal `FAILED_TIMEOUT`/`DLQ` status is already recorded by the time a slow invocation finally returns, that late result is discarded rather than overwriting it.
+ - **Human-in-the-Loop Replays**: Agents cannot fire destructive API requests directly. Unless `ENABLE_AUTO_REPLAY=true`, replay actions invoked by the LLM are queued for an operator to approve via `approve_replays.py`. The queue is **one document per packet id** under the `pending_replays` storage root (`get_scoped_storage`), not the `src/db/pending_replays.jsonl` file it used to be: that file lived on whichever pod happened to write it, so under `CASEBOOK_STORAGE_BACKEND=s3` with more than one replica an operator saw only their own pod's entries and the rest were invisible indefinitely. `approve_replays.py` still drains any leftover local jsonl for backwards compatibility. Both the auto-replay call and `approve_replays.py` send the replay payload as an authenticated (`OIS_API_KEY`) JSON body rather than query params, so PII like `notificationEmail`/`notificationMobile` doesn't land in server access logs. The packet id is pattern-guarded (`EVENT_ID_PATTERN`) before it is interpolated into a storage path.
+ - **Safe Self-Learning & Drift Checks**: The Reviewer's `add_learning_rule` tool stages suggestions to `src/prompts/pending_rules.jsonl` using `filelock`. A human runs `src/tools/promote_rules.py` (which includes top-level locking and git-status safety checks) to approve the rules -- committing them is opt-in (`--commit`), so promoting and committing stay separate decisions; only promoted entries are removed from the pending file, so skipped/errored/concurrently-appended entries survive. Additionally, `src/tools/check_drift.py` detects database schema/policy drift, and distinguishes a genuinely changed schema from a malformed single-column CSV export.
+diff --git a/README.md b/README.md
+index 237d964..34f8743 100644
+--- a/README.md
++++ b/README.md
+@@ -698,7 +698,8 @@ agentic-resident-crm/
+ │   │   ├── agent_orchestrator.py   # LangGraph StateGraph build + LLM provisioning
+ │   │   ├── rejection_context.py    # The direct lane's three prompts, in a fixed order, under
+ │   │   │                           #   REJECTION_PROMPT_MAX_CHARS (logs trimmed, nothing else)
+-│   │   └── checkpointer.py         # Checkpointer backend: sqlite (default) or postgres
++│   │   ├── checkpointer.py         # Checkpointer backend: sqlite (default), postgres, or mysql
++│   │   └── mysql_saver.py          # The mysql saver, replacing a connection MySQL has closed
+ │   ├── dlt/                        # Dead-letter topic analysis (parallel flow; see DLT_PLAN.md)
+ │   │   ├── headers.py              # Spring DLT header contract, hex epoch decoding
+ │   │   ├── stacktrace.py           # `Caused by:` chain parsing, frames, fingerprint, FrameLocation
+diff --git a/requirements.txt b/requirements.txt
+index 46e5748..a9ce3e0 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -18,6 +18,9 @@ langchain-mistralai==1.1.2
+ langgraph==1.1.10
+ langgraph-checkpoint==4.0.2
+ langgraph-checkpoint-sqlite==3.0.3
++# CHECKPOINT_BACKEND=mysql (src/core/checkpointer.py). PyMySQL below is its
++# driver; it needs langgraph-checkpoint>=2.1.2 and nothing else.
++langgraph-checkpoint-mysql==3.0.0
+ deepagents==0.5.3
+ # Model Context Protocol: the agent tool server and its client
+ # (src/tools/mcp_server.py, src/tools/mcp_client.py). mcp 2.x -- FastMCP is
+@@ -62,7 +65,3 @@ jsonschema==4.26.0
+ 
+ # Optional: only needed for CHECKPOINT_BACKEND=postgres (multi-replica).
+ # langgraph-checkpoint-postgres
+-
+-# Optional: only needed for CHECKPOINT_BACKEND=mysql (multi-replica, no
+-# Postgres support). PyMySQL above is its driver.
+-# langgraph-checkpoint-mysql
+diff --git a/src/api/routes.py b/src/api/routes.py
+index f3ae8cd..946cf99 100644
+--- a/src/api/routes.py
++++ b/src/api/routes.py
+@@ -406,6 +406,40 @@ def _publish_to_dlq_best_effort(payload, error_message: str) -> None:
+                      error=f"{type(e).__name__}: {e}")
+ 
+ 
++def _discard_checkpoints(agent, event_id: str) -> None:
++    """Delete the packet's checkpoints once its run is over. Never raises.
++
++    Nothing reads a finished run's checkpoints: a redelivery of a terminal
++    packet is skipped, and a packet run again starts on an emptied thread
++    (`invoke_fresh`). They were kept all the same, and the SQLite file in the
++    pod's writable layer grew 0.9-3.2 MiB a packet until the pod was evicted
++    for ephemeral storage (2026-11-20). A packet the API shut down on keeps
++    them: its redelivery resumes from them (FAILED_SHUTDOWN).
++    """
++    checkpointer = getattr(agent, "checkpointer", None)
++    if not checkpointer:
++        return
++    try:
++        checkpointer.delete_thread(event_id)
++    except Exception as e:
++        logger.bind(event_id=event_id).warning(
++            "Could not delete the packet's checkpoints",
++            error=f"{type(e).__name__}: {e}")
++
++
++def _discard_abandoned_checkpoints(agent, event_id: str,
++                                   run: concurrent.futures.Future) -> None:
++    """`_discard_checkpoints` for a run the route stopped waiting for, as a
++    done-callback: the run goes on writing checkpoints until it reaches its
++    next step, so deleting them any earlier would leave the rest behind.
++
++    A run that never started wrote nothing, and its callback runs on the
++    event loop, which a database call would block.
++    """
++    if not run.cancelled():
++        _discard_checkpoints(agent, event_id)
++
++
+ def _log_abandoned_run(event_id: str, run: concurrent.futures.Future) -> None:
+     """Say how a run ended after the route stopped waiting for it.
+ 
+@@ -1053,6 +1087,8 @@ async def _investigate_packet(signal: MessagePayload, outcome: dict):
+             # running one stops at its next model call, tool call or node.
+             cancel.set()
+             run.add_done_callback(functools.partial(_log_abandoned_run, event_id))
++            run.add_done_callback(functools.partial(
++                _discard_abandoned_checkpoints, agent, event_id))
+             log.error(
+                 "Agent invocation exceeded server-side budget",
+                 exc_info=False,
+@@ -1094,6 +1130,7 @@ async def _investigate_packet(signal: MessagePayload, outcome: dict):
+         _score_packet_status(trace_ref, "DLQ")
+         from src.utils.case_cleanup import cleanup_casebook_dir
+         cleanup_casebook_dir(event_id)
++        await _off_loop(_discard_checkpoints, agent, event_id)
+         return {"status": "dlq", "event_id": event_id, "error": str(e)}
+ 
+     log.info("Agent investigation complete", state="COMPLETED_GRAPH")
+@@ -1357,6 +1394,7 @@ async def _investigate_packet(signal: MessagePayload, outcome: dict):
+             state=current_status,
+         )
+         outcome["status"] = "discarded_late_result"
++        await _off_loop(_discard_checkpoints, agent, event_id)
+         return {"status": "already_processed", "event_id": event_id}
+ 
+     # casebook.json and status.json reach the terminal status together, so a
+@@ -1376,6 +1414,7 @@ async def _investigate_packet(signal: MessagePayload, outcome: dict):
+ 
+     from src.utils.case_cleanup import cleanup_casebook_dir
+     cleanup_casebook_dir(event_id)
++    await _off_loop(_discard_checkpoints, agent, event_id)
+ 
+     final_status = casebook_data["packet_status"]["status"]
+     _score_packet_status(trace_ref, final_status)
+diff --git a/src/core/agent_factory.py b/src/core/agent_factory.py
+index bc0302e..b236602 100644
+--- a/src/core/agent_factory.py
++++ b/src/core/agent_factory.py
+@@ -171,6 +171,13 @@ def build_agent(role: str, model, system_prompt: str, tools: Sequence = (), *,
+     }
+     # The run name is what a Langfuse trace calls the agent (utils/tracing):
+     # `investigator-agent`, typed as an agent there. `name` stays the role.
++    #
++    # No checkpointer: run inside a graph node, an agent compiled without one
++    # inherits the graph's, and the SQLite saver stores the whole state --
++    # the prompt with its logs -- at every one of the agent's internal steps.
++    # That was 0.9-3.2 MiB a packet, never deleted, until pods were evicted
++    # for ephemeral storage (2026-11-20). The graph still checkpoints between
++    # nodes, so a crashed run resumes at the agent's node and runs it again.
+     agent = create_deep_agent(
+         model=model,
+         tools=[*explicit, *registered],
+@@ -178,6 +185,7 @@ def build_agent(role: str, model, system_prompt: str, tools: Sequence = (), *,
+         middleware=_limits(),
+         subagents=[general_purpose],
+         name=role,
++        checkpointer=False,
+     ).with_config({"run_name": tracing.agent_name(role)})
+     logger.info("Agent built", role=role, service_pack=pack,
+                 explicit_tools=[tool.name for tool in explicit],
+diff --git a/src/core/checkpointer.py b/src/core/checkpointer.py
+index 69a2c56..67f8959 100644
+--- a/src/core/checkpointer.py
++++ b/src/core/checkpointer.py
+@@ -5,15 +5,18 @@ Checkpointer selection (ENHANCEMENT_PLAN.md 4.7).
+ system to one node (S3CasebookStorage removed the first). Two API replicas
+ cannot share a SQLite file across pods, so a packet checkpointed by one
+ replica cannot be resumed by another -- which defeats the resume-from-
+-checkpoint path that MAX_IN_PROGRESS_AGE_SECONDS and DLQ replay rely on.
++checkpoint path that MAX_IN_PROGRESS_AGE_SECONDS takeovers and FAILED_SHUTDOWN
++redeliveries rely on. On Kubernetes the file also sits in the container's
++writable layer, which counts toward the pod's ephemeral-storage limit.
+ 
+ CHECKPOINT_BACKEND selects:
+   sqlite    -- local file, the default, unchanged behaviour
+   postgres  -- shared, suitable for multiple replicas
+   mysql     -- shared, for organisations without Postgres support
+ 
+-Postgres and MySQL are imported lazily and their drivers are optional
+-dependencies: a single-node deployment must not be forced to install either.
++Postgres and MySQL are imported lazily, so a sqlite deployment loads neither.
++langgraph-checkpoint-mysql ships in the image (requirements.txt);
++langgraph-checkpoint-postgres does not.
+ """
+ import os
+ import sqlite3
+@@ -39,6 +42,11 @@ _checkpointer_identity = None
+ _checkpointer_lock = threading.Lock()
+ #: Held so health_check() can probe the live connection instead of opening one.
+ _sqlite_conn = None
++#: The context manager `PostgresSaver.from_conn_string` returned. It owns the
++#: connection: entered and then dropped, it was garbage-collected at once and
++#: closed the connection the saver had just been given, so the first query
++#: failed. Kept for as long as the checkpointer it built.
++_postgres_context = None
+ 
+ 
+ def backend_name() -> str:
+@@ -92,6 +100,7 @@ def _build_sqlite():
+ 
+ 
+ def _build_postgres():
++    global _postgres_context
+     uri = os.environ.get("CHECKPOINT_POSTGRES_URI", "").strip()
+     if not uri:
+         raise ValueError(
+@@ -108,8 +117,10 @@ def _build_postgres():
+ 
+     checkpointer = PostgresSaver.from_conn_string(uri)
+     # Enter the context manager's setup explicitly: from_conn_string returns a
+-    # context manager, but the graph outlives any `with` block here.
++    # context manager, but the graph outlives any `with` block here. The
++    # context manager is kept, or collecting it would close the connection.
+     if hasattr(checkpointer, "__enter__"):
++        _postgres_context = checkpointer
+         checkpointer = checkpointer.__enter__()
+ 
+     # Idempotent; creates the checkpoint tables on first run.
+@@ -126,18 +137,19 @@ def _build_mysql():
+         )
+ 
+     try:
+-        from langgraph.checkpoint.mysql.pymysql import PyMySQLSaver
++        from src.core.mysql_saver import ReconnectingPyMySQLSaver
+     except ImportError as e:
+         raise ImportError(
+             "CHECKPOINT_BACKEND=mysql requires langgraph-checkpoint-mysql: "
+             "pip install langgraph-checkpoint-mysql"
+         ) from e
+ 
+-    checkpointer = PyMySQLSaver.from_conn_string(uri)
+-    # Enter the context manager's setup explicitly: from_conn_string returns a
+-    # context manager, but the graph outlives any `with` block here.
+-    if hasattr(checkpointer, "__enter__"):
+-        checkpointer = checkpointer.__enter__()
++    # On its own connection, not `PyMySQLSaver.from_conn_string`: that is a
++    # context manager, and entering it and dropping it closed the connection
++    # before setup() ran, so this backend failed on its first query
++    # (2026-11-20). The saver also replaces the connection once MySQL has
++    # closed it (core/mysql_saver.py).
++    checkpointer = ReconnectingPyMySQLSaver(uri)
+ 
+     # Idempotent; creates the checkpoint tables on first run.
+     checkpointer.setup()
+@@ -195,10 +207,15 @@ def health_check() -> bool:
+         _sqlite_conn.execute("SELECT 1")
+         return True
+ 
+-    # psycopg connections and pools both expose execute(); PyMySQLSaver's raw
+-    # pymysql connection does not (queries go through a cursor instead), so it
+-    # falls through to the "successfully built saver" signal below -- the best
+-    # available without opening a cursor on every probe.
++    # A pymysql connection has no execute(), so this used to report a saver
++    # whose connection MySQL had closed as healthy, while every packet failed
++    # (2026-11-20). ping() runs a query, reconnecting first if it has to.
++    if backend_name() == "mysql":
++        checkpointer.ping()
++        return True
++
++    # psycopg connections and pools both expose execute(); anything else
++    # falls through to the "successfully built saver" signal below.
+     conn = getattr(checkpointer, "conn", None)
+     if conn is None or not hasattr(conn, "execute"):
+         return checkpointer is not None
+@@ -208,8 +225,9 @@ def health_check() -> bool:
+ 
+ def reset_checkpointer():
+     """Drop the cached checkpointer. For tests and config reloads."""
+-    global _checkpointer, _checkpointer_identity, _sqlite_conn
++    global _checkpointer, _checkpointer_identity, _sqlite_conn, _postgres_context
+     with _checkpointer_lock:
+         _checkpointer = None
+         _checkpointer_identity = None
+         _sqlite_conn = None
++        _postgres_context = None
+diff --git a/src/core/mysql_saver.py b/src/core/mysql_saver.py
+new file mode 100644
+index 0000000..bdab66e
+--- /dev/null
++++ b/src/core/mysql_saver.py
+@@ -0,0 +1,65 @@
++"""
++The MySQL checkpointer (CHECKPOINT_BACKEND=mysql): `PyMySQLSaver` on a
++connection that is replaced when MySQL has closed it.
++
++`PyMySQLSaver` keeps one pymysql connection for the life of the process and
++never reconnects. MySQL closes a connection left idle longer than its
++`wait_timeout`, and a MySQL restart or a firewall can close it sooner. Every
++later query then failed -- "Lost connection to MySQL server during query",
++then `InterfaceError: (0, '')` -- so every packet failed until the pod
++restarted, while /ready kept passing (seen against MySQL 8.4 on 2026-11-20).
++
++So each query first pings the connection under the saver's own lock, and one
++that does not answer is replaced. pymysql's `ping(reconnect=True)` did the
++same, but pymysql 1.2 deprecates it.
++
++Imported only by `checkpointer._build_mysql`, so a sqlite or postgres
++deployment never loads langgraph-checkpoint-mysql.
++"""
++from contextlib import contextmanager
++
++import pymysql
++from langgraph.checkpoint.mysql.pymysql import PyMySQLSaver
++
++
++class ReconnectingPyMySQLSaver(PyMySQLSaver):
++    """`PyMySQLSaver` that reconnects when MySQL has closed its connection."""
++
++    def __init__(self, uri: str):
++        self._connect_kwargs = PyMySQLSaver.parse_conn_string(uri)
++        super().__init__(self._connect())
++
++    def _connect(self) -> pymysql.Connection:
++        # autocommit as `from_conn_string` sets it: `setup()` and every query
++        # outside a pipeline rely on it.
++        return pymysql.connect(**self._connect_kwargs, autocommit=True)
++
++    @contextmanager
++    def _cursor(self, *, pipeline: bool = False):
++        # The base class reads `self.conn` here and nowhere else, so a
++        # connection replaced before this runs is the one every query uses.
++        with self.lock:
++            self._reconnect_if_closed()
++        with super()._cursor(pipeline=pipeline) as cur:
++            yield cur
++
++    def _reconnect_if_closed(self) -> None:
++        """Replace the connection if it no longer answers. The caller holds
++        `self.lock`, so no query is using it meanwhile."""
++        try:
++            self.conn.ping()
++            return
++        except (pymysql.err.Error, OSError):
++            pass
++        try:
++            self.conn.close()
++        except (pymysql.err.Error, OSError):
++            pass  # Already closed, which is why it is being replaced.
++        self.conn = self._connect()
++
++    def ping(self) -> None:
++        """Run a query, reconnecting first if MySQL closed the connection.
++        Raises when MySQL cannot be reached. For /ready
++        (`checkpointer.health_check`)."""
++        with self._cursor() as cur:
++            cur.execute("SELECT 1")
+diff --git a/tests/test_agent_factory.py b/tests/test_agent_factory.py
+index 5798181..c1b904d 100644
+--- a/tests/test_agent_factory.py
++++ b/tests/test_agent_factory.py
+@@ -203,3 +203,30 @@ def test_an_explicit_tool_may_not_share_a_registered_name(probe_tool):
+     with pytest.raises(ValueError, match="both passed explicitly and served over MCP"):
+         build_agent("reviewer", ScriptedModel(replies=[]), "ROLE", tools=[probe_lookup],
+                     pack=PACK)
++
++
++def test_an_agent_run_in_a_graph_node_writes_no_checkpoints_of_its_own():
++    """Compiled without a checkpointer, an agent inherited the graph's and
++    saved its whole state at every internal step -- the prompt with its logs.
++    In the SQLite file that was 0.9-3.2 MiB a packet, never deleted, and pods
++    were evicted for ephemeral storage (2026-11-20). Only the graph's own
++    namespace may be saved."""
++    from langgraph.checkpoint.memory import InMemorySaver
++    from langgraph.graph import START, MessagesState, StateGraph
++
++    agent = build_agent("synthesis", ScriptedModel(replies=[AIMessage(content="ok")]),
++                        "ROLE", pack=PACK)
++    assert agent.checkpointer is False
++
++    def node(state):
++        result = agent.invoke({"messages": [HumanMessage(content="x")]})
++        return {"messages": result["messages"][-1:]}
++
++    builder = StateGraph(MessagesState)
++    builder.add_node("synthesize", node)
++    builder.add_edge(START, "synthesize")
++    saver = InMemorySaver()
++    builder.compile(checkpointer=saver).invoke(
++        {"messages": [HumanMessage(content="go")]}, {"configurable": {"thread_id": "t"}})
++
++    assert set(saver.storage["t"]) == {""}
+diff --git a/tests/test_checkpoint_cleanup.py b/tests/test_checkpoint_cleanup.py
+new file mode 100644
+index 0000000..b21adfb
+--- /dev/null
++++ b/tests/test_checkpoint_cleanup.py
+@@ -0,0 +1,136 @@
++"""
++A packet's checkpoints are deleted once it is terminal (routes._discard_checkpoints).
++
++Nothing read a finished run's checkpoints, and nothing deleted them: the
++SQLite file in the pod's writable layer grew 0.9-3.2 MiB a packet until pods
++were evicted for ephemeral storage (2026-11-20). They go after the casebook is
++saved, on the DLQ path, when a late result is discarded, and for a run past
++its budget once it has stopped. A packet the API shut down on keeps them for
++its redelivery (FAILED_SHUTDOWN), which the drain path never deletes.
++"""
++import concurrent.futures
++import json
++import threading
++import time
++from unittest.mock import MagicMock, patch
++
++import src.api.routes as routes
++import src.core.agent_orchestrator as orch
++from src.core import checkpointer, run_control
++from src.models.unified_casebook import rejection_short_record, save_casebook
++from test_end_to_end import _run, _stub_llm, storage  # noqa: F401  (storage: a fixture)
++
++SYNTHESIS = json.dumps({
++    "rejection_description": "manual dedup rejected the packet",
++    "synthesis": "ask the resident to resubmit",
++    "action": "RESIDENT_PACKET_RESUBMIT",
++    "resident_action": "NEW_PACKET",
++    "confidence": 0.9,
++})
++
++
++def _rows(saver, thread_id) -> int:
++    return sum(saver.conn.execute(f"SELECT count(*) FROM {table} WHERE thread_id = ?",
++                                  (thread_id,)).fetchone()[0]
++               for table in ("checkpoints", "writes"))
++
++
++def _graph_stub(**behaviour):
++    """The whole graph, mocked: `get_state` finds nothing to resume."""
++    agent = MagicMock()
++    agent.get_state.return_value = None
++    for name, value in behaviour.items():
++        setattr(agent.invoke, name, value)
++    return agent
++
++
++def test_a_processed_packets_checkpoints_are_deleted(storage, monkeypatch):  # noqa: F811
++    """Through the real graph and SQLite saver: the run checkpointed, and
++    nothing of it is left once the casebook is saved."""
++    saver = checkpointer.get_checkpointer()
++    left_at_delete = []
++    real_delete = saver.delete_thread
++
++    def delete(thread_id):
++        left_at_delete.append(_rows(saver, thread_id))
++        real_delete(thread_id)
++
++    monkeypatch.setattr(saver, "delete_thread", delete)
++    monkeypatch.setattr(orch, "is_reviewer_approved", lambda _f: True)
++    with patch.object(orch, "build_agent", side_effect=lambda *a, **k: _stub_llm(SYNTHESIS)), \
++            patch.object(orch, "get_llm", side_effect=lambda tier: MagicMock()):
++        assert _run("cleanup-processed")["status"] == "processed"
++
++    assert storage.terminal_status("cleanup-processed")
++    assert left_at_delete and left_at_delete[0] > 0
++    assert _rows(saver, "cleanup-processed") == 0
++
++
++def test_a_dead_lettered_packets_checkpoints_are_deleted(storage):  # noqa: F811
++    agent = _graph_stub(side_effect=RuntimeError("the graph failed"))
++    with patch("src.api.routes.get_agent", return_value=agent), \
++            patch("src.api.routes.publish_to_dlq"):
++        assert _run("cleanup-dlq")["status"] == "dlq"
++
++    agent.checkpointer.delete_thread.assert_called_once_with("cleanup-dlq")
++
++
++def test_a_discarded_late_results_checkpoints_are_deleted(storage):  # noqa: F811
++    def invoke(*args, **kwargs):
++        # The consumer gave up on this run and recorded its own verdict meanwhile.
++        save_casebook(storage, "cleanup-late",
++                      rejection_short_record("cleanup-late", "FAILED_TIMEOUT", "gave up"))
++        return {"synthesis": SYNTHESIS}
++
++    agent = _graph_stub(side_effect=invoke)
++    with patch("src.api.routes.get_agent", return_value=agent):
++        assert _run("cleanup-late")["status"] == "already_processed"
++
++    agent.checkpointer.delete_thread.assert_called_once_with("cleanup-late")
++
++
++def test_a_timed_out_runs_checkpoints_are_deleted_once_it_has_stopped(storage, monkeypatch):  # noqa: F811
++    """The run goes on writing checkpoints until its next step, so they are
++    deleted when it stops, not when the route stops waiting."""
++    monkeypatch.setenv("AGENT_INVOKE_TIMEOUT_SECONDS", "0.1")
++    stopped = threading.Event()
++    deleted = threading.Event()
++
++    def slow_invoke(*args, **kwargs):
++        deadline = time.monotonic() + 5
++        while time.monotonic() < deadline and not run_control.cancelled():
++            time.sleep(0.01)
++        stopped.set()
++        run_control.check()
++
++    agent = _graph_stub(side_effect=slow_invoke)
++    deleted_after_stop = []
++    agent.checkpointer.delete_thread.side_effect = (
++        lambda thread_id: (deleted_after_stop.append(stopped.is_set()), deleted.set()))
++    with patch("src.api.routes.get_agent", return_value=agent), \
++            patch("src.api.routes.publish_to_dlq"):
++        assert _run("cleanup-timeout")["status"] == "failed_timeout"
++
++    assert deleted.wait(5)
++    agent.checkpointer.delete_thread.assert_called_once_with("cleanup-timeout")
++    assert deleted_after_stop == [True]
++
++
++def test_a_run_that_never_started_deletes_nothing():
++    """Its done-callback runs on the event loop, and it wrote nothing."""
++    run = concurrent.futures.Future()
++    run.cancel()
++    agent = MagicMock()
++
++    routes._discard_abandoned_checkpoints(agent, "never-started", run)
++
++    agent.checkpointer.delete_thread.assert_not_called()
++
++
++def test_a_failed_delete_does_not_fail_the_packet(storage):  # noqa: F811
++    agent = _graph_stub(return_value={"synthesis": SYNTHESIS})
++    agent.checkpointer.delete_thread.side_effect = RuntimeError("MySQL went away")
++    with patch("src.api.routes.get_agent", return_value=agent):
++        assert _run("cleanup-delete-fails")["status"] == "processed"
++
++    assert storage.terminal_status("cleanup-delete-fails")
+diff --git a/tests/test_mysql_checkpointer.py b/tests/test_mysql_checkpointer.py
+new file mode 100644
+index 0000000..b107866
+--- /dev/null
++++ b/tests/test_mysql_checkpointer.py
+@@ -0,0 +1,235 @@
++"""
++CHECKPOINT_BACKEND=mysql (core/checkpointer.py, core/mysql_saver.py).
++
++Two defects, found against MySQL 8.4 on 2026-11-20, kept this backend from
++ever working:
++
++- `_build_mysql` entered the context manager `PyMySQLSaver.from_conn_string`
++  returns and kept only the saver. The context manager was collected at once,
++  which closed the connection, so `setup()` failed with
++  `InterfaceError: (0, '')`. `_build_postgres` did the same.
++- The saver keeps one connection and never reconnected. Once MySQL closed it
++  (idle past `wait_timeout`, a restart), every packet failed, while
++  `health_check` kept reporting it healthy.
++
++The unit tests stand in a fake connection for pymysql's. The last test runs
++against a real MySQL when CHECKPOINT_TEST_MYSQL_URI names a database it may
++create tables in, e.g. one from `docker run -p 127.0.0.1:3307:3306 mysql:8.4`.
++"""
++import gc
++import os
++import sys
++import time
++import types
++from contextlib import contextmanager
++
++import pymysql
++import pytest
++from langchain_core.messages import AIMessage, HumanMessage
++from langgraph.graph import START, MessagesState, StateGraph
++
++from src.core import checkpointer
++from src.core.mysql_saver import ReconnectingPyMySQLSaver
++
++URI = "mysql://su01:secret@db.example:3306/agentic_crm"
++
++#: A real MySQL database the last test may create tables in; unset, it skips.
++REAL_MYSQL_URI = os.environ.get("CHECKPOINT_TEST_MYSQL_URI", "")
++
++
++class FakeCursor:
++    def __init__(self, conn):
++        self.conn = conn
++
++    def __enter__(self):
++        return self
++
++    def __exit__(self, *exc):
++        return False
++
++    def execute(self, sql, args=None):
++        if self.conn.lost:
++            raise pymysql.err.OperationalError(2013, "Lost connection to MySQL server during query")
++        self.conn.queries.append(" ".join(sql.split()))
++
++    def fetchone(self):
++        return None
++
++    def fetchall(self):
++        return []
++
++
++class FakeConnection:
++    """pymysql's connection, as far as the saver and the ping use it."""
++
++    def __init__(self, kwargs):
++        self.kwargs = kwargs
++        self.queries = []
++        self.lost = False
++        self.closed = False
++
++    def cursor(self, *args):
++        return FakeCursor(self)
++
++    def ping(self, reconnect=False):
++        if self.lost or self.closed:
++            raise pymysql.err.OperationalError(2013, "Lost connection to MySQL server during query")
++        self.queries.append("PING")
++
++    def close(self):
++        if self.closed:
++            raise pymysql.err.Error("Already closed")
++        self.closed = True
++
++    def begin(self):
++        pass
++
++    def commit(self):
++        pass
++
++    def rollback(self):
++        pass
++
++
++@pytest.fixture
++def mysql(monkeypatch):
++    """CHECKPOINT_BACKEND=mysql on fake connections; yields the list of them,
++    in the order they were opened."""
++    connections = []
++
++    def connect(**kwargs):
++        connection = FakeConnection(kwargs)
++        connections.append(connection)
++        return connection
++
++    monkeypatch.setattr(pymysql, "connect", connect)
++    monkeypatch.setenv("CHECKPOINT_BACKEND", "mysql")
++    monkeypatch.setenv("CHECKPOINT_MYSQL_URI", URI)
++    checkpointer.reset_checkpointer()
++    yield connections
++    checkpointer.reset_checkpointer()
++
++
++def test_the_mysql_checkpointer_keeps_its_connection_and_sets_up(mysql):
++    saver = checkpointer.get_checkpointer()
++    gc.collect()
++
++    assert isinstance(saver, ReconnectingPyMySQLSaver)
++    (connection,) = mysql
++    assert not connection.closed, "the builder must not close the connection it gave the saver"
++    assert connection.kwargs == {"host": "db.example", "port": 3306, "user": "su01",
++                                 "password": "secret", "database": "agentic_crm",
++                                 "unix_socket": None, "autocommit": True}
++    created = [q for q in connection.queries if q.startswith("CREATE TABLE IF NOT EXISTS")]
++    assert {q.split()[5] for q in created} == {"checkpoint_migrations", "checkpoints",
++                                               "checkpoint_blobs", "checkpoint_writes"}
++
++
++def test_a_live_connection_is_kept(mysql):
++    saver = checkpointer.get_checkpointer()
++    saver.delete_thread("evt-1")
++    assert checkpointer.health_check() is True
++
++    assert len(mysql) == 1
++    assert mysql[0].queries[-1] == "SELECT 1"
++
++
++def test_a_connection_mysql_closed_is_replaced_before_the_next_query(mysql):
++    saver = checkpointer.get_checkpointer()
++    mysql[0].lost = True
++
++    saver.delete_thread("evt-1")  # a transaction (pipeline=True)
++
++    first, second = mysql
++    assert first.closed
++    assert saver.conn is second
++    assert any(q.startswith("DELETE FROM checkpoints WHERE thread_id") for q in second.queries)
++
++
++def test_health_check_queries_mysql_and_reconnects(mysql):
++    """/ready used to pass on a saver whose connection MySQL had closed."""
++    checkpointer.get_checkpointer()
++    mysql[0].lost = True
++
++    assert checkpointer.health_check() is True
++    assert mysql[1].queries[-1] == "SELECT 1"
++
++
++def test_health_check_fails_while_mysql_is_unreachable(mysql, monkeypatch):
++    checkpointer.get_checkpointer()
++    mysql[0].lost = True
++
++    def refuse(**kwargs):
++        raise pymysql.err.OperationalError(2003, "Can't connect to MySQL server")
++
++    monkeypatch.setattr(pymysql, "connect", refuse)
++    with pytest.raises(pymysql.err.OperationalError):
++        checkpointer.health_check()
++
++
++def test_the_postgres_checkpointer_keeps_its_connection_open(monkeypatch):
++    """The same dropped context manager, on the postgres builder."""
++
++    class FakePostgresSaver:
++        def __init__(self, conn):
++            self.conn = conn
++
++        @classmethod
++        @contextmanager
++        def from_conn_string(cls, uri):
++            conn = types.SimpleNamespace(closed=False)
++            try:
++                yield cls(conn)
++            finally:
++                conn.closed = True
++
++        def setup(self):
++            assert not self.conn.closed, "setup() ran on a closed connection"
++
++    module = types.ModuleType("langgraph.checkpoint.postgres")
++    module.PostgresSaver = FakePostgresSaver
++    monkeypatch.setitem(sys.modules, "langgraph.checkpoint.postgres", module)
++    monkeypatch.setenv("CHECKPOINT_BACKEND", "postgres")
++    monkeypatch.setenv("CHECKPOINT_POSTGRES_URI", "postgresql://u:p@db.example/checkpoints")
++    checkpointer.reset_checkpointer()
++    try:
++        saver = checkpointer.get_checkpointer()
++        gc.collect()
++        assert saver.conn.closed is False
++    finally:
++        checkpointer.reset_checkpointer()
++
++
++def _graph(saver):
++    builder = StateGraph(MessagesState)
++    builder.add_node("answer", lambda state: {"messages": [AIMessage(content="ok")]})
++    builder.add_edge(START, "answer")
++    return builder.compile(checkpointer=saver)
++
++
++@pytest.mark.skipif(not REAL_MYSQL_URI,
++                    reason="set CHECKPOINT_TEST_MYSQL_URI to a MySQL database it may write to")
++def test_against_a_real_mysql(monkeypatch):
++    monkeypatch.setenv("CHECKPOINT_BACKEND", "mysql")
++    monkeypatch.setenv("CHECKPOINT_MYSQL_URI", REAL_MYSQL_URI)
++    checkpointer.reset_checkpointer()
++    try:
++        saver = checkpointer.get_checkpointer()
++        graph = _graph(saver)
++
++        def run(thread):
++            config = {"configurable": {"thread_id": thread}}
++            graph.invoke({"messages": [HumanMessage(content="hi")]}, config)
++            assert len(graph.get_state(config).values["messages"]) == 2
++            saver.delete_thread(thread)
++            assert saver.get_tuple(config) is None
++
++        run("checkpointer-test-1")
++        # MySQL closes the connection once it has been idle past wait_timeout.
++        with saver.conn.cursor() as cur:
++            cur.execute("SET SESSION wait_timeout = 1")
++        time.sleep(2)
++        assert checkpointer.health_check() is True
++        run("checkpointer-test-2")
++    finally:
++        checkpointer.reset_checkpointer()
