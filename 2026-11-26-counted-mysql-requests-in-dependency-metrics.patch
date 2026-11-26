@@ -1,0 +1,2357 @@
+diff --git a/src/core/mysql_saver.py b/src/core/mysql_saver.py
+index 6aa97dd..db3ff0b 100644
+--- a/src/core/mysql_saver.py
++++ b/src/core/mysql_saver.py
+@@ -13,6 +13,10 @@ So each query first pings the connection under the saver's own lock, and one
+ that does not answer is replaced. pymysql's `ping(reconnect=True)` did the
+ same, but pymysql 1.2 deprecates it.
+ 
++Each request to MySQL is counted and timed in the dependency metrics as
++`mysql`, under the saver method that made it, and every connection opened as
++`connect`: one at start, then one each time MySQL had closed the last.
++
+ Imported only by `checkpointer._build_mysql`, so a sqlite or postgres
+ deployment never loads langgraph-checkpoint-mysql.
+ """
+@@ -22,6 +26,9 @@ from contextlib import contextmanager
+ 
+ import pymysql
+ from langgraph.checkpoint.mysql.pymysql import PyMySQLSaver
++from pymysql.constants import CR
++
++from src.utils import metrics
+ 
+ #: The columns this saver writes, per table: the column lists of
+ #: langgraph-checkpoint-mysql's INSERT statements, which also cover every
+@@ -41,6 +48,11 @@ REQUIRED_COLUMNS = {
+ #: `checkpoint_ns_hash`. `DEFAULT_GENERATED` (an expression default) is not one.
+ _GENERATED = re.compile(r"\b(VIRTUAL|STORED|PERSISTENT) GENERATED\b", re.IGNORECASE)
+ 
++#: pymysql's errors for a request MySQL never answered: it could not be
++#: reached, or the connection went away before the answer came.
++_NO_ANSWER = (CR.CR_CONNECTION_ERROR, CR.CR_CONN_HOST_ERROR, CR.CR_SERVER_GONE_ERROR,
++              CR.CR_SERVER_LOST)
++
+ 
+ class CheckpointTablesError(RuntimeError):
+     """The checkpoint tables cannot take what this saver writes."""
+@@ -56,7 +68,8 @@ class ReconnectingPyMySQLSaver(PyMySQLSaver):
+     def _connect(self) -> pymysql.Connection:
+         # autocommit as `from_conn_string` sets it: every query outside a
+         # pipeline relies on it.
+-        return pymysql.connect(**self._connect_kwargs, autocommit=True)
++        with _track_request("connect"):
++            return pymysql.connect(**self._connect_kwargs, autocommit=True)
+ 
+     @contextmanager
+     def _cursor(self, *, pipeline: bool = False):
+@@ -81,6 +94,31 @@ class ReconnectingPyMySQLSaver(PyMySQLSaver):
+             pass  # Already closed, which is why it is being replaced.
+         self.conn = self._connect()
+ 
++    # The saver's requests, each counted and timed under its own name.
++
++    def get_tuple(self, config):
++        with _track_request("get_tuple"):
++            return super().get_tuple(config)
++
++    def list(self, config, **kwargs):
++        with _track_request("list"):
++            # Read whole, as LangGraph's get_state_history reads it, so the
++            # time is the queries', not the caller's between two checkpoints.
++            checkpoints = [*super().list(config, **kwargs)]
++        yield from checkpoints
++
++    def put(self, config, checkpoint, metadata, new_versions):
++        with _track_request("put"):
++            return super().put(config, checkpoint, metadata, new_versions)
++
++    def put_writes(self, config, writes, task_id, task_path=""):
++        with _track_request("put_writes"):
++            super().put_writes(config, writes, task_id, task_path)
++
++    def delete_thread(self, thread_id):
++        with _track_request("delete_thread"):
++            super().delete_thread(thread_id)
++
+     def check_tables(self) -> None:
+         """Check, only reading, that the checkpoint tables can take this
+         saver's rows. Raises `CheckpointTablesError` when they cannot.
+@@ -93,7 +131,9 @@ class ReconnectingPyMySQLSaver(PyMySQLSaver):
+         Sharing the tables is safe for the rows: every query names the
+         thread, and this app's thread ids are its event ids.
+         """
+-        with self._cursor() as cur:
++        # The query alone is counted: refusing the tables is this app's
++        # verdict on MySQL's answer, not a request that failed.
++        with _track_request("check_tables"), self._cursor() as cur:
+             # Aliased: MySQL 8 labels information_schema columns in upper case.
+             cur.execute("SELECT table_name AS tbl, column_name AS col, extra AS extra "
+                         "FROM information_schema.columns WHERE table_schema = DATABASE()")
+@@ -111,7 +151,7 @@ class ReconnectingPyMySQLSaver(PyMySQLSaver):
+         """Run a query, reconnecting first if MySQL closed the connection.
+         Raises when MySQL cannot be reached. For /ready
+         (`checkpointer.health_check`)."""
+-        with self._cursor() as cur:
++        with _track_request("ping"), self._cursor() as cur:
+             cur.execute("SELECT 1")
+ 
+ 
+@@ -131,3 +171,33 @@ def _unusable(columns: dict) -> list:
+             problems.append(f"{table}.checkpoint_ns_hash is a generated column, "
+                             "which cannot take the value this saver writes")
+     return problems
++
++
++def _track_request(operation: str):
++    """Count and time one request to MySQL in the dependency metrics."""
++    return metrics.dependency_request("mysql", operation, classify=_request_outcome,
++                                      describe=_error_name)
++
++
++def _request_outcome(error) -> str:
++    """How a request that raised is counted (metrics.dependency_request):
++    `unreachable` when MySQL never answered it, `error` when MySQL refused
++    it -- a lock wait timeout, a deadlock, a missing privilege."""
++    if isinstance(error, (OSError, pymysql.err.InterfaceError)):
++        return "unreachable"
++    if isinstance(error, pymysql.err.OperationalError) and _error_number(error) in _NO_ANSWER:
++        return "unreachable"
++    return "error"
++
++
++def _error_name(error) -> str:
++    """The exception's class and MySQL's error number, `OperationalError
++    2013`: the class alone does not tell a lost connection from a deadlock."""
++    number = _error_number(error)
++    return f"{type(error).__name__} {number}" if number else type(error).__name__
++
++
++def _error_number(error):
++    """MySQL's error number, which pymysql gives an error as its first argument."""
++    args = error.args if isinstance(error, pymysql.err.MySQLError) else ()
++    return args[0] if args and isinstance(args[0], int) else None
+diff --git a/src/utils/metrics.py b/src/utils/metrics.py
+index cf12719..46e124e 100644
+--- a/src/utils/metrics.py
++++ b/src/utils/metrics.py
+@@ -282,30 +282,33 @@ LOG_PODS = _counter(
+ # External dependencies --------------------------------------------------
+ DEPENDENCY_REQUESTS = _counter(
+     "agentic_resident_crm_dependency_requests_total",
+-    "Requests to external dependencies, by dependency (s3, kafka, and "
+-    "crm_api: a consumer's forward to the API), operation and outcome: ok, "
+-    "not_found and conflict (answers rather than failures: an absent key, a "
+-    "conditional write another writer won), timeout, unreachable, "
+-    "http_<status> or error.",
++    "Requests to external dependencies, by dependency (s3, kafka, mysql: "
++    "the checkpointer's, and crm_api: a consumer's forward to the API), "
++    "operation and outcome: ok, not_found and conflict (answers rather than "
++    "failures: an absent key, a conditional write another writer won), "
++    "timeout, unreachable, http_<status> or error.",
+     ("dependency", "operation", "outcome"),
+ )
+ 
+ # Buckets run to 600s for the consumers' forwards, which wait for a whole
+-# investigation; an S3 or Kafka request sits in the first few.
++# investigation, and start at 1ms for a MySQL query; an S3 or Kafka request
++# sits in the first few.
+ DEPENDENCY_DURATION = _histogram(
+     "agentic_resident_crm_dependency_request_duration_seconds",
+     "Latency of a request to an external dependency, by dependency, "
+     "operation and outcome. A download is timed until its body is read.",
+     ("dependency", "operation", "outcome"),
+-    buckets=(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60,
+-             120, 300, 600, float("inf")),
++    buckets=(0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5,
++             10, 30, 60, 120, 300, 600, float("inf")),
+ )
+ 
+ DEPENDENCY_ERRORS = _counter(
+     "agentic_resident_crm_dependency_errors_total",
+     "Failed requests to external dependencies, by dependency, operation and "
+-    "error: the S3 error code (AccessDenied, SlowDown, ...) or the exception "
+-    "class (EndpointConnectionError, KafkaTimeoutError, ReadTimeout, ...).",
++    "error: the S3 error code (AccessDenied, SlowDown, ...), the exception "
++    "class with MySQL's error number (OperationalError 2013, ...) or the "
++    "exception class (EndpointConnectionError, KafkaTimeoutError, "
++    "ReadTimeout, ...).",
+     ("dependency", "operation", "error"),
+ )
+ 
+@@ -700,15 +703,16 @@ _ANSWERED = ("ok", "not_found", "conflict")
+ 
+ 
+ @contextmanager
+-def dependency_request(dependency: str, operation: str, classify=None):
++def dependency_request(dependency: str, operation: str, classify=None, describe=None):
+     """Count and time one request to an external dependency.
+ 
+     Yields a dict on which the caller sets `bytes` once the request has moved
+     its body. A request that raises is counted under `classify(error)` --
+-    `error` without a classifier -- and the exception goes on unchanged: this
+-    only watches. Counted however the request ends, for the reason
+-    `_packet_metrics` in routes.py counts every exit (G15): a failure that
+-    skipped the count would leave the error rate unobservable.
++    `error` without a classifier -- and a failure under `describe(error)`,
++    the S3 error code or the exception's class without one. The exception
++    goes on unchanged: this only watches. Counted however the request ends,
++    for the reason `_packet_metrics` in routes.py counts every exit (G15): a
++    failure that skipped the count would leave the error rate unobservable.
+     """
+     request = {"bytes": 0}
+     outcome = "error"
+@@ -719,7 +723,7 @@ def dependency_request(dependency: str, operation: str, classify=None):
+     except Exception as error:
+         outcome = _outcome_of(error, classify)
+         if outcome not in _ANSWERED:
+-            _record_dependency_error(dependency, operation, _error_name(error))
++            _record_dependency_error(dependency, operation, _error_name(error, describe))
+         raise
+     finally:
+         _record_dependency_request(dependency, operation, outcome,
+@@ -733,8 +737,14 @@ def _outcome_of(error, classify) -> str:
+         return "error"
+ 
+ 
+-def _error_name(error) -> str:
+-    """The error code an S3 error carries, else the exception's class."""
++def _error_name(error, describe=None) -> str:
++    """What `describe` names the error, else the error code an S3 error
++    carries, else the exception's class."""
++    if describe:
++        try:
++            return str(describe(error))
++        except Exception:
++            pass
+     response = getattr(error, "response", None)
+     if isinstance(response, dict):
+         code = (response.get("Error") or {}).get("Code")
+diff --git a/tests/test_dependency_and_intake_metrics.py b/tests/test_dependency_and_intake_metrics.py
+index 8bec7d5..d5f624a 100644
+--- a/tests/test_dependency_and_intake_metrics.py
++++ b/tests/test_dependency_and_intake_metrics.py
+@@ -95,6 +95,20 @@ def test_a_failure_is_counted_under_its_error_code():
+                        ("operation", "upload")): 1}
+ 
+ 
++@pytest.mark.parametrize("describe, name", [
++    (lambda error: f"{type(error).__name__} 2013", "OSError 2013"),
++    (lambda error: 1 / 0, "OSError"),  # a describer that fails
++])
++def test_a_failure_is_named_as_the_caller_describes_it(describe, name):
++    def query():
++        with pytest.raises(OSError):
++            with metrics.dependency_request("t-named", "query", describe=describe):
++                raise OSError("lost")
++
++    assert _increments(metrics.DEPENDENCY_ERRORS, query) == {
++        (("dependency", "t-named"), ("error", name), ("operation", "query")): 1}
++
++
+ def test_a_metric_that_cannot_be_recorded_never_fails_the_request(monkeypatch):
+     """Under multiprocess mode a record is a file write, which can fail."""
+     class Unwritable:
+diff --git a/tests/test_mysql_checkpointer.py b/tests/test_mysql_checkpointer.py
+index 539460a..0e556b7 100644
+--- a/tests/test_mysql_checkpointer.py
++++ b/tests/test_mysql_checkpointer.py
+@@ -18,9 +18,13 @@ ALTER TABLE on them, then "Duplicate key name 'checkpoints_thread_id_idx'" on
+ every start. The app now only connects: it never runs `setup()`, and checks,
+ reading only, that the tables have every column it writes.
+ 
+-The unit tests stand in a fake connection for pymysql's. The last test runs
+-against a real MySQL when CHECKPOINT_TEST_MYSQL_URI names a database it may
+-create tables in, e.g. one from `docker run -p 127.0.0.1:3307:3306 mysql:8.4`.
++MySQL is an external dependency like S3 and Kafka, so each request the saver
++makes is counted and timed in the dependency metrics, as `mysql`.
++
++The unit tests stand in a fake connection for pymysql's. The last two tests
++run against a real MySQL when CHECKPOINT_TEST_MYSQL_URI names a database they
++may create tables in, e.g. one from
++`docker run -p 127.0.0.1:3307:3306 mysql:8.4`.
+ """
+ import gc
+ import os
+@@ -33,16 +37,18 @@ from contextlib import contextmanager
+ import pymysql
+ import pytest
+ from langchain_core.messages import AIMessage, HumanMessage
++from langgraph.checkpoint.base import empty_checkpoint
+ from langgraph.checkpoint.mysql import base as saver_sql
+ from langgraph.checkpoint.mysql.pymysql import PyMySQLSaver
+ from langgraph.graph import START, MessagesState, StateGraph
+ 
+-from src.core import checkpointer
++from src.core import checkpointer, mysql_saver
+ from src.core.mysql_saver import (
+     REQUIRED_COLUMNS,
+     CheckpointTablesError,
+     ReconnectingPyMySQLSaver,
+ )
++from src.utils import metrics
+ 
+ URI = "mysql://app@db.example:3306/agentic_crm"
+ 
+@@ -68,8 +74,13 @@ class FakeCursor:
+     def execute(self, sql, args=None):
+         if self.conn.lost:
+             raise pymysql.err.OperationalError(2013, "Lost connection to MySQL server during query")
++        if self.conn.refusal is not None:
++            raise self.conn.refusal
+         self.conn.queries.append(" ".join(sql.split()))
+ 
++    def executemany(self, sql, args):
++        self.execute(sql)
++
+     def fetchone(self):
+         return None
+ 
+@@ -92,6 +103,8 @@ class FakeConnection:
+         self.queries = []
+         self.lost = False
+         self.closed = False
++        #: The error MySQL answers every query with, if any.
++        self.refusal = None
+ 
+     def cursor(self, *args):
+         return FakeCursor(self)
+@@ -259,6 +272,142 @@ def test_health_check_fails_while_mysql_is_unreachable(mysql, monkeypatch):
+         checkpointer.health_check()
+ 
+ 
++# ======================================================================
++# Metrics
++# ======================================================================
++
++needs_metrics = pytest.mark.skipif(not metrics.METRICS_AVAILABLE,
++                                   reason="prometheus_client is an optional dependency")
++
++#: A checkpoint of one packet's thread.
++CONFIG = {"configurable": {"thread_id": "evt-1", "checkpoint_ns": "", "checkpoint_id": "1"}}
++
++
++def _increments(counter, act) -> dict:
++    """{labels: increase} for every series of `counter` that `act()` moved."""
++    def samples():
++        return {tuple(sorted(sample.labels.items())): sample.value
++                for family in counter.collect() for sample in family.samples
++                if sample.name.endswith("_total")}
++
++    before = samples()
++    act()
++    after = samples()
++    return {labels: value - before.get(labels, 0)
++            for labels, value in after.items() if value != before.get(labels, 0)}
++
++
++def _request(operation, outcome="ok"):
++    return (("dependency", "mysql"), ("operation", operation), ("outcome", outcome))
++
++
++def _error(operation, error):
++    return (("dependency", "mysql"), ("error", error), ("operation", operation))
++
++
++def _counted(act) -> tuple:
++    """The requests and the errors `act()` counted."""
++    requests = {}
++    errors = _increments(metrics.DEPENDENCY_ERRORS,
++                         lambda: requests.update(_increments(metrics.DEPENDENCY_REQUESTS, act)))
++    return requests, errors
++
++
++@needs_metrics
++def test_starting_counts_the_connection_and_the_table_check(mysql):
++    assert _increments(metrics.DEPENDENCY_REQUESTS, checkpointer.get_checkpointer) == {
++        _request("connect"): 1, _request("check_tables"): 1}
++
++
++@needs_metrics
++def test_tables_it_refuses_are_an_answer_not_a_failed_request(mysql, monkeypatch):
++    monkeypatch.setattr(FakeConnection, "schema", {"tickets": [("id", "")]})
++
++    def start():
++        with pytest.raises(CheckpointTablesError):
++            checkpointer.get_checkpointer()
++
++    assert _counted(start) == ({_request("connect"): 1, _request("check_tables"): 1}, {})
++
++
++@needs_metrics
++@pytest.mark.parametrize("operation, call", [
++    ("get_tuple", lambda saver: saver.get_tuple(CONFIG)),
++    ("list", lambda saver: [*saver.list(CONFIG)]),
++    ("put", lambda saver: saver.put(CONFIG, empty_checkpoint(), {}, {})),
++    ("put_writes", lambda saver: saver.put_writes(CONFIG, [("messages", "hi")], "task-1")),
++    ("delete_thread", lambda saver: saver.delete_thread("evt-1")),
++    ("ping", lambda saver: checkpointer.health_check()),
++])
++def test_each_request_is_counted_under_the_method_that_made_it(mysql, operation, call):
++    """Once: the ping that checks the connection first is part of it."""
++    saver = checkpointer.get_checkpointer()
++
++    assert _increments(metrics.DEPENDENCY_REQUESTS, lambda: call(saver)) == {
++        _request(operation): 1}
++
++
++@needs_metrics
++def test_a_connection_mysql_closed_is_counted_as_a_new_one(mysql):
++    saver = checkpointer.get_checkpointer()
++    mysql[0].lost = True
++
++    assert _increments(metrics.DEPENDENCY_REQUESTS, lambda: saver.delete_thread("evt-1")) == {
++        _request("connect"): 1, _request("delete_thread"): 1}
++
++
++@needs_metrics
++def test_a_request_mysql_never_answered_is_unreachable(mysql, monkeypatch):
++    saver = checkpointer.get_checkpointer()
++    mysql[0].lost = True
++
++    def refuse(**kwargs):
++        raise pymysql.err.OperationalError(2003, "Can't connect to MySQL server")
++
++    monkeypatch.setattr(pymysql, "connect", refuse)
++
++    def put():
++        with pytest.raises(pymysql.err.OperationalError):
++            saver.put(CONFIG, empty_checkpoint(), {}, {})
++
++    assert _counted(put) == (
++        {_request("connect", "unreachable"): 1, _request("put", "unreachable"): 1},
++        {_error("connect", "OperationalError 2003"): 1, _error("put", "OperationalError 2003"): 1})
++
++
++@needs_metrics
++def test_a_request_mysql_refused_is_an_error_named_by_its_number(mysql):
++    saver = checkpointer.get_checkpointer()
++    mysql[0].refusal = pymysql.err.OperationalError(1205, "Lock wait timeout exceeded")
++
++    def delete():
++        with pytest.raises(pymysql.err.OperationalError):
++            saver.delete_thread("evt-1")
++
++    assert _counted(delete) == ({_request("delete_thread", "error"): 1},
++                                {_error("delete_thread", "OperationalError 1205"): 1})
++
++
++@pytest.mark.parametrize("error, outcome, name", [
++    (pymysql.err.OperationalError(2003, "Can't connect to MySQL server"),
++     "unreachable", "OperationalError 2003"),
++    (pymysql.err.OperationalError(2006, "MySQL server has gone away"),
++     "unreachable", "OperationalError 2006"),
++    (pymysql.err.OperationalError(2013, "Lost connection to MySQL server during query"),
++     "unreachable", "OperationalError 2013"),
++    (pymysql.err.InterfaceError(0, ""), "unreachable", "InterfaceError"),
++    (ConnectionResetError("Connection reset by peer"), "unreachable", "ConnectionResetError"),
++    (pymysql.err.OperationalError(1213, "Deadlock found when trying to get lock"),
++     "error", "OperationalError 1213"),
++    (pymysql.err.ProgrammingError(1146, "Table 'crm.checkpoints' doesn't exist"),
++     "error", "ProgrammingError 1146"),
++    (ValueError("a checkpoint it could not read"), "error", "ValueError"),
++])
++def test_a_failed_request_is_counted_by_whether_mysql_answered(error, outcome, name):
++    assert mysql_saver._request_outcome(error) == outcome
++    assert mysql_saver._error_name(error) == name
++
++
+ def test_the_postgres_checkpointer_keeps_its_connection_open(monkeypatch):
+     """The same dropped context manager, on the postgres builder."""
+ 
+@@ -329,3 +478,46 @@ def test_against_a_real_mysql(monkeypatch):
+         run("checkpointer-test-2")
+     finally:
+         checkpointer.reset_checkpointer()
++
++
++@needs_metrics
++@pytest.mark.skipif(not REAL_MYSQL_URI,
++                    reason="set CHECKPOINT_TEST_MYSQL_URI to a MySQL database it may write to")
++def test_metrics_against_a_real_mysql(monkeypatch):
++    with PyMySQLSaver.from_conn_string(REAL_MYSQL_URI) as owner:
++        owner.setup()
++
++    monkeypatch.setenv("CHECKPOINT_BACKEND", "mysql")
++    monkeypatch.setenv("CHECKPOINT_MYSQL_URI", REAL_MYSQL_URI)
++    checkpointer.reset_checkpointer()
++    try:
++        saver = checkpointer.get_checkpointer()
++        config = {"configurable": {"thread_id": "checkpointer-metrics-test"}}
++
++        ran = _increments(metrics.DEPENDENCY_REQUESTS, lambda: _graph(saver).invoke(
++            {"messages": [HumanMessage(content="hi")]}, config))
++        assert set(ran) == {_request("get_tuple"), _request("put"), _request("put_writes")}
++
++        with saver.conn.cursor() as cur:
++            cur.execute("SET SESSION wait_timeout = 1")
++        time.sleep(2)
++        assert _increments(metrics.DEPENDENCY_REQUESTS,
++                           lambda: saver.delete_thread("checkpointer-metrics-test")) == {
++            _request("connect"): 1, _request("delete_thread"): 1}
++
++        # Nothing listens on port 1.
++        connect = pymysql.connect
++        monkeypatch.setattr(pymysql, "connect",
++                            lambda **kwargs: connect(**{**kwargs, "port": 1}))
++        saver.conn.close()
++
++        def ping():
++            with pytest.raises(pymysql.err.OperationalError):
++                checkpointer.health_check()
++
++        assert _counted(ping) == (
++            {_request("connect", "unreachable"): 1, _request("ping", "unreachable"): 1},
++            {_error("connect", "OperationalError 2003"): 1,
++             _error("ping", "OperationalError 2003"): 1})
++    finally:
++        checkpointer.reset_checkpointer()
+diff --git a/tools/grafana/README.md b/tools/grafana/README.md
+index caeb0e9..03a52dc 100644
+--- a/tools/grafana/README.md
++++ b/tools/grafana/README.md
+@@ -45,10 +45,15 @@ packet is processed.
+ - *Log pipeline* counts each packet's fetch by how it went (`fetched`,
+   `no_logs`, `failed`, `breaker_open`, `error`, `not_searched`, `disabled`)
+   before the per-source panels.
+-- *External dependencies* time and count every S3 and Kafka request. A
++- *External dependencies* time and count every S3, Kafka and MySQL request. A
+   `not_found` (a probe for an object not written yet) or a `conflict` (a
+   conditional write another pod won) is an answer, not an error, and is
+   left out of the error shares.
++- The MySQL row is the checkpointer's, with `CHECKPOINT_BACKEND=mysql`; on
++  sqlite it stays empty. Its error share is also on the overview. `connect`
++  counts the connections opened: one when a process starts, then one each
++  time MySQL had closed the last. A failure is named by the exception and
++  MySQL's error number (`OperationalError 2013`).
+ - A metric with labels appears only after it is first counted, so a panel
+   says "No data" until that path runs (the DLT panels until a DLT record
+   arrives). The DLT row is collapsed; open it when DLT_ENABLED=true.
+diff --git a/tools/grafana/build_dashboard.py b/tools/grafana/build_dashboard.py
+index 570b3a9..8c34557 100644
+--- a/tools/grafana/build_dashboard.py
++++ b/tools/grafana/build_dashboard.py
+@@ -171,6 +171,7 @@ PS = f"{INST}, {SVC}"
+ S3 = f'{INST}, dependency="s3"'
+ KAFKA = f'{INST}, dependency="kafka"'
+ API = f'{INST}, dependency="crm_api"'
++MYSQL = f'{INST}, dependency="mysql"'
+ # What an S3 request that failed ended as: not_found and conflict are answers.
+ S3_FAILED = ', outcome!~"ok|not_found|conflict"'
+ FETCH_FAILED = 'outcome=~"failed|breaker_open|error"'
+@@ -230,6 +231,10 @@ share("S3 error share",
+       f"({inc('dependency_requests_total', S3 + S3_FAILED)} or vector(0)) / {inc('dependency_requests_total', S3)}",
+       decimals=2, thresholds=[GREEN, amber(0.01), red(0.05)],
+       desc="An absent key and a conditional write another pod won are answers, not errors.")
++share("MySQL error share",
++      f"({inc('dependency_requests_total', MYSQL + ', outcome!=\"ok\"')} or vector(0)) / {inc('dependency_requests_total', MYSQL)}",
++      decimals=2, thresholds=[GREEN, amber(0.01), red(0.05)],
++      desc="The checkpointer's requests (CHECKPOINT_BACKEND=mysql) that MySQL never answered or refused.")
+ flush()
+ 
+ 
+@@ -386,6 +391,38 @@ ts("Kafka errors / min by operation and error",
+ ts("Kafka bytes published by operation",
+    [(r("dependency_bytes_total", KAFKA, "operation"), "{{operation}}")], unit="Bps")
+ 
++row("External dependencies: MySQL (checkpoints)")
++ts("MySQL requests / min by operation and outcome",
++   [(r("dependency_requests_total", MYSQL, "operation, outcome", " * 60"), "{{operation}} {{outcome}}")],
++   stack=True, desc="The checkpointer's requests, with CHECKPOINT_BACKEND=mysql. get_tuple: a thread's last "
++                    "checkpoint. put, put_writes: a checkpoint, a step's writes. delete_thread: a finished "
++                    "packet's checkpoints. ping: the /ready probe. connect: a connection opened. "
++                    "check_tables: the check at start.")
++ts("MySQL error share by operation",
++   [(f"{r('dependency_requests_total', MYSQL + ', outcome!=\"ok\"', 'operation')} / "
++     f"{r('dependency_requests_total', MYSQL, 'operation')}", "{{operation}}")],
++   unit="percentunit", minv=0,
++   desc="unreachable: MySQL never answered (it could not be reached, or the connection was lost). "
++        "error: MySQL refused the request.")
++ts("MySQL checkpoint read / write latency (p50 / p95 / p99)",
++   [(q(quant, "dependency_request_duration_seconds",
++       MYSQL + ', operation=~"get_tuple|put|put_writes", outcome="ok"'), label)
++    for quant, label in ((0.5, "p50"), (0.95, "p95"), (0.99, "p99"))],
++   unit="s", desc="Successful get_tuple, put and put_writes requests: what a packet's graph waits for at "
++                  "each step. Each includes the ping that checks the connection first.")
++ts("MySQL latency p95 by operation and outcome",
++   [(q(0.95, "dependency_request_duration_seconds", MYSQL, "operation, outcome"), "{{operation}} {{outcome}}")],
++   unit="s")
++ts("MySQL errors / min by operation and error",
++   [(r("dependency_errors_total", MYSQL, "operation, error", " * 60"), "{{operation}} {{error}}")], stack=True,
++   desc="The exception and MySQL's error number: 2003 could not connect, 2006 gone away, 2013 lost the "
++        "connection, 1205 lock wait timeout, 1213 deadlock, 1142 a privilege the user lacks.")
++ts("MySQL connections opened / hour by outcome",
++   [(r("dependency_requests_total", MYSQL + ', operation="connect"', "outcome", " * 3600"), "{{outcome}}")],
++   stack=True, desc="One when a process starts, then one each time MySQL had closed the last: idle past "
++                    "wait_timeout, a restart, a failover. More than one per pod start means MySQL, or "
++                    "something between, is closing connections.")
++
+ 
+ # ---------------------------------------------------------------- Breakers
+ row("Circuit breakers")
+diff --git a/tools/grafana/packet-crm-dashboard.json b/tools/grafana/packet-crm-dashboard.json
+index 7ff628b..2bb2438 100644
+--- a/tools/grafana/packet-crm-dashboard.json
++++ b/tools/grafana/packet-crm-dashboard.json
+@@ -1326,23 +1326,95 @@
+         "orientation": "auto"
+       }
+     },
++    {
++      "type": "stat",
++      "title": "MySQL error share",
++      "id": 20,
++      "datasource": {
++        "type": "prometheus",
++        "uid": "${datasource}"
++      },
++      "description": "The checkpointer's requests (CHECKPOINT_BACKEND=mysql) that MySQL never answered or refused.",
++      "gridPos": {
++        "h": 4,
++        "w": 4,
++        "x": 0,
++        "y": 13
++      },
++      "targets": [
++        {
++          "datasource": {
++            "type": "prometheus",
++            "uid": "${datasource}"
++          },
++          "expr": "(sum (increase(agentic_resident_crm_dependency_requests_total{namespace=~\"$namespace\", instance=~\"$instance\", dependency=\"mysql\", outcome!=\"ok\"}[$__range])) or vector(0)) / sum (increase(agentic_resident_crm_dependency_requests_total{namespace=~\"$namespace\", instance=~\"$instance\", dependency=\"mysql\"}[$__range]))",
++          "legendFormat": "__auto",
++          "refId": "A",
++          "instant": true,
++          "range": false
++        }
++      ],
++      "fieldConfig": {
++        "defaults": {
++          "unit": "percentunit",
++          "thresholds": {
++            "mode": "absolute",
++            "steps": [
++              {
++                "color": "green",
++                "value": null
++              },
++              {
++                "color": "orange",
++                "value": 0.01
++              },
++              {
++                "color": "red",
++                "value": 0.05
++              }
++            ]
++          },
++          "color": {
++            "mode": "thresholds"
++          },
++          "decimals": 2,
++          "min": 0,
++          "max": 1
++        },
++        "overrides": []
++      },
++      "options": {
++        "reduceOptions": {
++          "calcs": [
++            "lastNotNull"
++          ],
++          "fields": "",
++          "values": false
++        },
++        "colorMode": "background",
++        "graphMode": "none",
++        "textMode": "auto",
++        "justifyMode": "auto",
++        "orientation": "auto"
++      }
++    },
+     {
+       "type": "row",
+       "title": "Packet intake: Kafka consumers and fetch stage",
+-      "id": 20,
++      "id": 21,
+       "collapsed": false,
+       "gridPos": {
+         "h": 1,
+         "w": 24,
+         "x": 0,
+-        "y": 13
++        "y": 17
+       },
+       "panels": []
+     },
+     {
+       "type": "timeseries",
+       "title": "Messages consumed / min by role and outcome",
+-      "id": 21,
++      "id": 22,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -1352,7 +1424,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 0,
+-        "y": 14
++        "y": 18
+       },
+       "targets": [
+         {
+@@ -1402,7 +1474,7 @@
+     {
+       "type": "timeseries",
+       "title": "Messages skipped / min by role and reason",
+-      "id": 22,
++      "id": 23,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -1412,7 +1484,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 12,
+-        "y": 14
++        "y": 18
+       },
+       "targets": [
+         {
+@@ -1462,7 +1534,7 @@
+     {
+       "type": "bargauge",
+       "title": "Packets by service (range)",
+-      "id": 23,
++      "id": 24,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -1472,7 +1544,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 0,
+-        "y": 22
++        "y": 26
+       },
+       "targets": [
+         {
+@@ -1513,7 +1585,7 @@
+     {
+       "type": "timeseries",
+       "title": "Fetch stage / min by service and outcome",
+-      "id": 24,
++      "id": 25,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -1523,7 +1595,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 12,
+-        "y": 22
++        "y": 26
+       },
+       "targets": [
+         {
+@@ -1573,7 +1645,7 @@
+     {
+       "type": "timeseries",
+       "title": "Forwards to the API / min by endpoint and outcome",
+-      "id": 25,
++      "id": 26,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -1583,7 +1655,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 0,
+-        "y": 30
++        "y": 34
+       },
+       "targets": [
+         {
+@@ -1633,7 +1705,7 @@
+     {
+       "type": "timeseries",
+       "title": "Forward latency p95 by endpoint",
+-      "id": 26,
++      "id": 27,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -1643,7 +1715,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 12,
+-        "y": 30
++        "y": 34
+       },
+       "targets": [
+         {
+@@ -1693,20 +1765,20 @@
+     {
+       "type": "row",
+       "title": "Rejection lane: packets",
+-      "id": 27,
++      "id": 28,
+       "collapsed": false,
+       "gridPos": {
+         "h": 1,
+         "w": 24,
+         "x": 0,
+-        "y": 38
++        "y": 42
+       },
+       "panels": []
+     },
+     {
+       "type": "timeseries",
+       "title": "Packets / min by status",
+-      "id": 28,
++      "id": 29,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -1716,7 +1788,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 0,
+-        "y": 39
++        "y": 43
+       },
+       "targets": [
+         {
+@@ -1766,7 +1838,7 @@
+     {
+       "type": "timeseries",
+       "title": "Packets / min by service",
+-      "id": 29,
++      "id": 30,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -1776,7 +1848,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 12,
+-        "y": 39
++        "y": 43
+       },
+       "targets": [
+         {
+@@ -1826,7 +1898,7 @@
+     {
+       "type": "timeseries",
+       "title": "Packet duration (p50 / p95 / p99)",
+-      "id": 30,
++      "id": 31,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -1836,7 +1908,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 0,
+-        "y": 47
++        "y": 51
+       },
+       "targets": [
+         {
+@@ -1904,7 +1976,7 @@
+     {
+       "type": "timeseries",
+       "title": "p95 duration by resolution source / service",
+-      "id": 31,
++      "id": 32,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -1914,7 +1986,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 12,
+-        "y": 47
++        "y": 51
+       },
+       "targets": [
+         {
+@@ -1964,7 +2036,7 @@
+     {
+       "type": "timeseries",
+       "title": "Analysis claims / min",
+-      "id": 32,
++      "id": 33,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -1974,7 +2046,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 0,
+-        "y": 55
++        "y": 59
+       },
+       "targets": [
+         {
+@@ -2024,7 +2096,7 @@
+     {
+       "type": "timeseries",
+       "title": "Rejections skipped / min (gate=enforce)",
+-      "id": 33,
++      "id": 34,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -2034,7 +2106,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 12,
+-        "y": 55
++        "y": 59
+       },
+       "targets": [
+         {
+@@ -2084,7 +2156,7 @@
+     {
+       "type": "timeseries",
+       "title": "Service resolutions by source",
+-      "id": 34,
++      "id": 35,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -2094,7 +2166,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 0,
+-        "y": 63
++        "y": 67
+       },
+       "targets": [
+         {
+@@ -2144,7 +2216,7 @@
+     {
+       "type": "timeseries",
+       "title": "Investigator retries (avg / p90)",
+-      "id": 35,
++      "id": 36,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -2154,7 +2226,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 12,
+-        "y": 63
++        "y": 67
+       },
+       "targets": [
+         {
+@@ -2213,20 +2285,20 @@
+     {
+       "type": "row",
+       "title": "Rejection lane: knowledge sources",
+-      "id": 36,
++      "id": 37,
+       "collapsed": false,
+       "gridPos": {
+         "h": 1,
+         "w": 24,
+         "x": 0,
+-        "y": 71
++        "y": 75
+       },
+       "panels": []
+     },
+     {
+       "type": "timeseries",
+       "title": "Runbook lookups / min by outcome",
+-      "id": 37,
++      "id": 38,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -2236,7 +2308,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 0,
+-        "y": 72
++        "y": 76
+       },
+       "targets": [
+         {
+@@ -2286,7 +2358,7 @@
+     {
+       "type": "timeseries",
+       "title": "Runbook hit rate by service",
+-      "id": 38,
++      "id": 39,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -2296,7 +2368,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 12,
+-        "y": 72
++        "y": 76
+       },
+       "targets": [
+         {
+@@ -2348,7 +2420,7 @@
+     {
+       "type": "timeseries",
+       "title": "Reason-code doc lookups / min",
+-      "id": 39,
++      "id": 40,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -2358,7 +2430,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 0,
+-        "y": 80
++        "y": 84
+       },
+       "targets": [
+         {
+@@ -2408,7 +2480,7 @@
+     {
+       "type": "timeseries",
+       "title": "Reason-code doc miss rate by service",
+-      "id": 40,
++      "id": 41,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -2418,7 +2490,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 12,
+-        "y": 80
++        "y": 84
+       },
+       "targets": [
+         {
+@@ -2470,7 +2542,7 @@
+     {
+       "type": "timeseries",
+       "title": "Prompt trims / min by node",
+-      "id": 41,
++      "id": 42,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -2480,7 +2552,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 0,
+-        "y": 88
++        "y": 92
+       },
+       "targets": [
+         {
+@@ -2530,7 +2602,7 @@
+     {
+       "type": "timeseries",
+       "title": "Shadow runbook divergence / hour",
+-      "id": 42,
++      "id": 43,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -2540,7 +2612,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 12,
+-        "y": 88
++        "y": 92
+       },
+       "targets": [
+         {
+@@ -2590,20 +2662,20 @@
+     {
+       "type": "row",
+       "title": "LLM",
+-      "id": 43,
++      "id": 44,
+       "collapsed": false,
+       "gridPos": {
+         "h": 1,
+         "w": 24,
+         "x": 0,
+-        "y": 96
++        "y": 100
+       },
+       "panels": []
+     },
+     {
+       "type": "timeseries",
+       "title": "Tokens / min by node and direction",
+-      "id": 44,
++      "id": 45,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -2613,7 +2685,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 0,
+-        "y": 97
++        "y": 101
+       },
+       "targets": [
+         {
+@@ -2663,7 +2735,7 @@
+     {
+       "type": "timeseries",
+       "title": "LLM calls / min by node and outcome",
+-      "id": 45,
++      "id": 46,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -2673,7 +2745,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 12,
+-        "y": 97
++        "y": 101
+       },
+       "targets": [
+         {
+@@ -2723,7 +2795,7 @@
+     {
+       "type": "timeseries",
+       "title": "LLM non-ok share by node",
+-      "id": 46,
++      "id": 47,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -2733,7 +2805,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 0,
+-        "y": 105
++        "y": 109
+       },
+       "targets": [
+         {
+@@ -2784,7 +2856,7 @@
+     {
+       "type": "timeseries",
+       "title": "Avg tokens per packet (rejection lane)",
+-      "id": 47,
++      "id": 48,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -2794,7 +2866,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 12,
+-        "y": 105
++        "y": 109
+       },
+       "targets": [
+         {
+@@ -2844,20 +2916,20 @@
+     {
+       "type": "row",
+       "title": "Log pipeline",
+-      "id": 48,
++      "id": 49,
+       "collapsed": false,
+       "gridPos": {
+         "h": 1,
+         "w": 24,
+         "x": 0,
+-        "y": 113
++        "y": 117
+       },
+       "panels": []
+     },
+     {
+       "type": "timeseries",
+       "title": "Packet log fetches / min by lane and outcome",
+-      "id": 49,
++      "id": 50,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -2867,7 +2939,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 0,
+-        "y": 114
++        "y": 118
+       },
+       "targets": [
+         {
+@@ -2917,7 +2989,7 @@
+     {
+       "type": "timeseries",
+       "title": "Packet log fetch problems / min by service and outcome",
+-      "id": 50,
++      "id": 51,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -2927,7 +2999,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 12,
+-        "y": 114
++        "y": 118
+       },
+       "targets": [
+         {
+@@ -2977,7 +3049,7 @@
+     {
+       "type": "timeseries",
+       "title": "Kubernetes pod log reads / min by outcome",
+-      "id": 51,
++      "id": 52,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -2987,7 +3059,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 0,
+-        "y": 122
++        "y": 126
+       },
+       "targets": [
+         {
+@@ -3037,7 +3109,7 @@
+     {
+       "type": "timeseries",
+       "title": "Log fetches / min by source and outcome",
+-      "id": 52,
++      "id": 53,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -3047,7 +3119,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 12,
+-        "y": 122
++        "y": 126
+       },
+       "targets": [
+         {
+@@ -3097,7 +3169,7 @@
+     {
+       "type": "timeseries",
+       "title": "Log fetch failure share by source",
+-      "id": 53,
++      "id": 54,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -3107,7 +3179,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 0,
+-        "y": 130
++        "y": 134
+       },
+       "targets": [
+         {
+@@ -3158,7 +3230,7 @@
+     {
+       "type": "timeseries",
+       "title": "Log fetch latency p95 by source",
+-      "id": 54,
++      "id": 55,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -3168,7 +3240,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 12,
+-        "y": 130
++        "y": 134
+       },
+       "targets": [
+         {
+@@ -3218,7 +3290,7 @@
+     {
+       "type": "timeseries",
+       "title": "Records per fetch (p50 / p95) by source",
+-      "id": 55,
++      "id": 56,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -3228,7 +3300,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 0,
+-        "y": 138
++        "y": 142
+       },
+       "targets": [
+         {
+@@ -3287,7 +3359,7 @@
+     {
+       "type": "timeseries",
+       "title": "Evidence gaps / hour by type",
+-      "id": 56,
++      "id": 57,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -3297,7 +3369,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 12,
+-        "y": 138
++        "y": 142
+       },
+       "targets": [
+         {
+@@ -3347,7 +3419,7 @@
+     {
+       "type": "timeseries",
+       "title": "PII redactions / min by pattern",
+-      "id": 57,
++      "id": 58,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -3357,7 +3429,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 0,
+-        "y": 146
++        "y": 150
+       },
+       "targets": [
+         {
+@@ -3407,20 +3479,20 @@
+     {
+       "type": "row",
+       "title": "External dependencies: S3",
+-      "id": 58,
++      "id": 59,
+       "collapsed": false,
+       "gridPos": {
+         "h": 1,
+         "w": 24,
+         "x": 0,
+-        "y": 154
++        "y": 158
+       },
+       "panels": []
+     },
+     {
+       "type": "timeseries",
+       "title": "S3 requests / min by operation and outcome",
+-      "id": 59,
++      "id": 60,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -3430,7 +3502,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 0,
+-        "y": 155
++        "y": 159
+       },
+       "targets": [
+         {
+@@ -3480,7 +3552,7 @@
+     {
+       "type": "timeseries",
+       "title": "S3 error share by operation",
+-      "id": 60,
++      "id": 61,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -3490,7 +3562,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 12,
+-        "y": 155
++        "y": 159
+       },
+       "targets": [
+         {
+@@ -3541,7 +3613,7 @@
+     {
+       "type": "timeseries",
+       "title": "S3 upload / download latency (p50 / p95 / p99)",
+-      "id": 61,
++      "id": 62,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -3551,7 +3623,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 0,
+-        "y": 163
++        "y": 167
+       },
+       "targets": [
+         {
+@@ -3619,7 +3691,7 @@
+     {
+       "type": "timeseries",
+       "title": "S3 latency p95 by operation and outcome",
+-      "id": 62,
++      "id": 63,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -3629,7 +3701,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 12,
+-        "y": 163
++        "y": 167
+       },
+       "targets": [
+         {
+@@ -3679,7 +3751,7 @@
+     {
+       "type": "timeseries",
+       "title": "S3 errors / min by operation and error",
+-      "id": 63,
++      "id": 64,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -3689,7 +3761,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 0,
+-        "y": 171
++        "y": 175
+       },
+       "targets": [
+         {
+@@ -3739,7 +3811,7 @@
+     {
+       "type": "timeseries",
+       "title": "S3 throughput by operation",
+-      "id": 64,
++      "id": 65,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -3749,7 +3821,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 12,
+-        "y": 171
++        "y": 175
+       },
+       "targets": [
+         {
+@@ -3799,20 +3871,20 @@
+     {
+       "type": "row",
+       "title": "External dependencies: Kafka",
+-      "id": 65,
++      "id": 66,
+       "collapsed": false,
+       "gridPos": {
+         "h": 1,
+         "w": 24,
+         "x": 0,
+-        "y": 179
++        "y": 183
+       },
+       "panels": []
+     },
+     {
+       "type": "timeseries",
+       "title": "Kafka requests / min by operation and outcome",
+-      "id": 66,
++      "id": 67,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -3822,7 +3894,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 0,
+-        "y": 180
++        "y": 184
+       },
+       "targets": [
+         {
+@@ -3872,7 +3944,7 @@
+     {
+       "type": "timeseries",
+       "title": "Kafka latency p95 by operation",
+-      "id": 67,
++      "id": 68,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -3882,7 +3954,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 12,
+-        "y": 180
++        "y": 184
+       },
+       "targets": [
+         {
+@@ -3932,7 +4004,7 @@
+     {
+       "type": "timeseries",
+       "title": "Kafka errors / min by operation and error",
+-      "id": 68,
++      "id": 69,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -3942,7 +4014,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 0,
+-        "y": 188
++        "y": 192
+       },
+       "targets": [
+         {
+@@ -3992,7 +4064,7 @@
+     {
+       "type": "timeseries",
+       "title": "Kafka bytes published by operation",
+-      "id": 69,
++      "id": 70,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -4002,7 +4074,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 12,
+-        "y": 188
++        "y": 192
+       },
+       "targets": [
+         {
+@@ -4051,31 +4123,31 @@
+     },
+     {
+       "type": "row",
+-      "title": "Circuit breakers",
+-      "id": 70,
++      "title": "External dependencies: MySQL (checkpoints)",
++      "id": 71,
+       "collapsed": false,
+       "gridPos": {
+         "h": 1,
+         "w": 24,
+         "x": 0,
+-        "y": 196
++        "y": 200
+       },
+       "panels": []
+     },
+     {
+-      "type": "state-timeline",
+-      "title": "Breaker state",
+-      "id": 71,
++      "type": "timeseries",
++      "title": "MySQL requests / min by operation and outcome",
++      "id": 72,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+       },
+-      "description": "0 closed, 1 half-open, 2 open. Agent-tool DB breakers here are the API process's, not the tool server's.",
++      "description": "The checkpointer's requests, with CHECKPOINT_BACKEND=mysql. get_tuple: a thread's last checkpoint. put, put_writes: a checkpoint, a step's writes. delete_thread: a finished packet's checkpoints. ping: the /ready probe. connect: a connection opened. check_tables: the check at start.",
+       "gridPos": {
+         "h": 8,
+-        "w": 24,
++        "w": 12,
+         "x": 0,
+-        "y": 197
++        "y": 201
+       },
+       "targets": [
+         {
+@@ -4083,92 +4155,484 @@
+             "type": "prometheus",
+             "uid": "${datasource}"
+           },
+-          "expr": "max by (breaker) (agentic_resident_crm_breaker_state{namespace=~\"$namespace\", instance=~\"$instance\"})",
+-          "legendFormat": "{{breaker}}",
++          "expr": "sum by (operation, outcome) (rate(agentic_resident_crm_dependency_requests_total{namespace=~\"$namespace\", instance=~\"$instance\", dependency=\"mysql\"}[$__rate_interval])) * 60",
++          "legendFormat": "{{operation}} {{outcome}}",
+           "refId": "A"
+         }
+       ],
+       "fieldConfig": {
+         "defaults": {
++          "unit": "short",
+           "custom": {
+-            "fillOpacity": 80,
+-            "lineWidth": 0
+-          },
+-          "color": {
+-            "mode": "thresholds"
+-          },
+-          "thresholds": {
+-            "mode": "absolute",
+-            "steps": [
+-              {
+-                "color": "green",
+-                "value": null
+-              },
+-              {
+-                "color": "orange",
+-                "value": 1
+-              },
+-              {
+-                "color": "red",
+-                "value": 2
+-              }
+-            ]
+-          },
+-          "mappings": [
+-            {
+-              "type": "value",
+-              "options": {
+-                "0": {
+-                  "text": "closed",
+-                  "color": "green",
+-                  "index": 0
+-                },
+-                "1": {
+-                  "text": "half-open",
+-                  "color": "orange",
+-                  "index": 1
+-                },
+-                "2": {
+-                  "text": "open",
+-                  "color": "red",
+-                  "index": 2
+-                }
+-              }
++            "drawStyle": "line",
++            "lineWidth": 1,
++            "fillOpacity": 15,
++            "showPoints": "never",
++            "spanNulls": false,
++            "stacking": {
++              "mode": "normal",
++              "group": "A"
+             }
+-          ]
++          }
+         },
+         "overrides": []
+       },
+       "options": {
+-        "showValue": "never",
+-        "mergeValues": true,
+-        "rowHeight": 0.8,
+         "legend": {
+-          "displayMode": "list",
+-          "placement": "bottom",
++          "displayMode": "table",
++          "placement": "right",
++          "calcs": [
++            "mean",
++            "max",
++            "lastNotNull"
++          ],
+           "showLegend": true
+         },
+         "tooltip": {
+-          "mode": "single"
++          "mode": "multi",
++          "sort": "desc"
+         }
+       }
+     },
+     {
+-      "type": "row",
+-      "title": "DLT lane",
+-      "id": 72,
++      "type": "timeseries",
++      "title": "MySQL error share by operation",
++      "id": 73,
++      "datasource": {
++        "type": "prometheus",
++        "uid": "${datasource}"
++      },
++      "description": "unreachable: MySQL never answered (it could not be reached, or the connection was lost). error: MySQL refused the request.",
++      "gridPos": {
++        "h": 8,
++        "w": 12,
++        "x": 12,
++        "y": 201
++      },
++      "targets": [
++        {
++          "datasource": {
++            "type": "prometheus",
++            "uid": "${datasource}"
++          },
++          "expr": "sum by (operation) (rate(agentic_resident_crm_dependency_requests_total{namespace=~\"$namespace\", instance=~\"$instance\", dependency=\"mysql\", outcome!=\"ok\"}[$__rate_interval])) / sum by (operation) (rate(agentic_resident_crm_dependency_requests_total{namespace=~\"$namespace\", instance=~\"$instance\", dependency=\"mysql\"}[$__rate_interval]))",
++          "legendFormat": "{{operation}}",
++          "refId": "A"
++        }
++      ],
++      "fieldConfig": {
++        "defaults": {
++          "unit": "percentunit",
++          "custom": {
++            "drawStyle": "line",
++            "lineWidth": 1,
++            "fillOpacity": 5,
++            "showPoints": "never",
++            "spanNulls": false,
++            "stacking": {
++              "mode": "none",
++              "group": "A"
++            }
++          },
++          "min": 0
++        },
++        "overrides": []
++      },
++      "options": {
++        "legend": {
++          "displayMode": "table",
++          "placement": "right",
++          "calcs": [
++            "mean",
++            "max",
++            "lastNotNull"
++          ],
++          "showLegend": true
++        },
++        "tooltip": {
++          "mode": "multi",
++          "sort": "desc"
++        }
++      }
++    },
++    {
++      "type": "timeseries",
++      "title": "MySQL checkpoint read / write latency (p50 / p95 / p99)",
++      "id": 74,
++      "datasource": {
++        "type": "prometheus",
++        "uid": "${datasource}"
++      },
++      "description": "Successful get_tuple, put and put_writes requests: what a packet's graph waits for at each step. Each includes the ping that checks the connection first.",
++      "gridPos": {
++        "h": 8,
++        "w": 12,
++        "x": 0,
++        "y": 209
++      },
++      "targets": [
++        {
++          "datasource": {
++            "type": "prometheus",
++            "uid": "${datasource}"
++          },
++          "expr": "histogram_quantile(0.5, sum by (le) (rate(agentic_resident_crm_dependency_request_duration_seconds_bucket{namespace=~\"$namespace\", instance=~\"$instance\", dependency=\"mysql\", operation=~\"get_tuple|put|put_writes\", outcome=\"ok\"}[$__rate_interval])))",
++          "legendFormat": "p50",
++          "refId": "A"
++        },
++        {
++          "datasource": {
++            "type": "prometheus",
++            "uid": "${datasource}"
++          },
++          "expr": "histogram_quantile(0.95, sum by (le) (rate(agentic_resident_crm_dependency_request_duration_seconds_bucket{namespace=~\"$namespace\", instance=~\"$instance\", dependency=\"mysql\", operation=~\"get_tuple|put|put_writes\", outcome=\"ok\"}[$__rate_interval])))",
++          "legendFormat": "p95",
++          "refId": "B"
++        },
++        {
++          "datasource": {
++            "type": "prometheus",
++            "uid": "${datasource}"
++          },
++          "expr": "histogram_quantile(0.99, sum by (le) (rate(agentic_resident_crm_dependency_request_duration_seconds_bucket{namespace=~\"$namespace\", instance=~\"$instance\", dependency=\"mysql\", operation=~\"get_tuple|put|put_writes\", outcome=\"ok\"}[$__rate_interval])))",
++          "legendFormat": "p99",
++          "refId": "C"
++        }
++      ],
++      "fieldConfig": {
++        "defaults": {
++          "unit": "s",
++          "custom": {
++            "drawStyle": "line",
++            "lineWidth": 1,
++            "fillOpacity": 5,
++            "showPoints": "never",
++            "spanNulls": false,
++            "stacking": {
++              "mode": "none",
++              "group": "A"
++            }
++          }
++        },
++        "overrides": []
++      },
++      "options": {
++        "legend": {
++          "displayMode": "table",
++          "placement": "right",
++          "calcs": [
++            "mean",
++            "max",
++            "lastNotNull"
++          ],
++          "showLegend": true
++        },
++        "tooltip": {
++          "mode": "multi",
++          "sort": "desc"
++        }
++      }
++    },
++    {
++      "type": "timeseries",
++      "title": "MySQL latency p95 by operation and outcome",
++      "id": 75,
++      "datasource": {
++        "type": "prometheus",
++        "uid": "${datasource}"
++      },
++      "description": "",
++      "gridPos": {
++        "h": 8,
++        "w": 12,
++        "x": 12,
++        "y": 209
++      },
++      "targets": [
++        {
++          "datasource": {
++            "type": "prometheus",
++            "uid": "${datasource}"
++          },
++          "expr": "histogram_quantile(0.95, sum by (le, operation, outcome) (rate(agentic_resident_crm_dependency_request_duration_seconds_bucket{namespace=~\"$namespace\", instance=~\"$instance\", dependency=\"mysql\"}[$__rate_interval])))",
++          "legendFormat": "{{operation}} {{outcome}}",
++          "refId": "A"
++        }
++      ],
++      "fieldConfig": {
++        "defaults": {
++          "unit": "s",
++          "custom": {
++            "drawStyle": "line",
++            "lineWidth": 1,
++            "fillOpacity": 5,
++            "showPoints": "never",
++            "spanNulls": false,
++            "stacking": {
++              "mode": "none",
++              "group": "A"
++            }
++          }
++        },
++        "overrides": []
++      },
++      "options": {
++        "legend": {
++          "displayMode": "table",
++          "placement": "right",
++          "calcs": [
++            "mean",
++            "max",
++            "lastNotNull"
++          ],
++          "showLegend": true
++        },
++        "tooltip": {
++          "mode": "multi",
++          "sort": "desc"
++        }
++      }
++    },
++    {
++      "type": "timeseries",
++      "title": "MySQL errors / min by operation and error",
++      "id": 76,
++      "datasource": {
++        "type": "prometheus",
++        "uid": "${datasource}"
++      },
++      "description": "The exception and MySQL's error number: 2003 could not connect, 2006 gone away, 2013 lost the connection, 1205 lock wait timeout, 1213 deadlock, 1142 a privilege the user lacks.",
++      "gridPos": {
++        "h": 8,
++        "w": 12,
++        "x": 0,
++        "y": 217
++      },
++      "targets": [
++        {
++          "datasource": {
++            "type": "prometheus",
++            "uid": "${datasource}"
++          },
++          "expr": "sum by (operation, error) (rate(agentic_resident_crm_dependency_errors_total{namespace=~\"$namespace\", instance=~\"$instance\", dependency=\"mysql\"}[$__rate_interval])) * 60",
++          "legendFormat": "{{operation}} {{error}}",
++          "refId": "A"
++        }
++      ],
++      "fieldConfig": {
++        "defaults": {
++          "unit": "short",
++          "custom": {
++            "drawStyle": "line",
++            "lineWidth": 1,
++            "fillOpacity": 15,
++            "showPoints": "never",
++            "spanNulls": false,
++            "stacking": {
++              "mode": "normal",
++              "group": "A"
++            }
++          }
++        },
++        "overrides": []
++      },
++      "options": {
++        "legend": {
++          "displayMode": "table",
++          "placement": "right",
++          "calcs": [
++            "mean",
++            "max",
++            "lastNotNull"
++          ],
++          "showLegend": true
++        },
++        "tooltip": {
++          "mode": "multi",
++          "sort": "desc"
++        }
++      }
++    },
++    {
++      "type": "timeseries",
++      "title": "MySQL connections opened / hour by outcome",
++      "id": 77,
++      "datasource": {
++        "type": "prometheus",
++        "uid": "${datasource}"
++      },
++      "description": "One when a process starts, then one each time MySQL had closed the last: idle past wait_timeout, a restart, a failover. More than one per pod start means MySQL, or something between, is closing connections.",
++      "gridPos": {
++        "h": 8,
++        "w": 12,
++        "x": 12,
++        "y": 217
++      },
++      "targets": [
++        {
++          "datasource": {
++            "type": "prometheus",
++            "uid": "${datasource}"
++          },
++          "expr": "sum by (outcome) (rate(agentic_resident_crm_dependency_requests_total{namespace=~\"$namespace\", instance=~\"$instance\", dependency=\"mysql\", operation=\"connect\"}[$__rate_interval])) * 3600",
++          "legendFormat": "{{outcome}}",
++          "refId": "A"
++        }
++      ],
++      "fieldConfig": {
++        "defaults": {
++          "unit": "short",
++          "custom": {
++            "drawStyle": "line",
++            "lineWidth": 1,
++            "fillOpacity": 15,
++            "showPoints": "never",
++            "spanNulls": false,
++            "stacking": {
++              "mode": "normal",
++              "group": "A"
++            }
++          }
++        },
++        "overrides": []
++      },
++      "options": {
++        "legend": {
++          "displayMode": "table",
++          "placement": "right",
++          "calcs": [
++            "mean",
++            "max",
++            "lastNotNull"
++          ],
++          "showLegend": true
++        },
++        "tooltip": {
++          "mode": "multi",
++          "sort": "desc"
++        }
++      }
++    },
++    {
++      "type": "row",
++      "title": "Circuit breakers",
++      "id": 78,
++      "collapsed": false,
++      "gridPos": {
++        "h": 1,
++        "w": 24,
++        "x": 0,
++        "y": 225
++      },
++      "panels": []
++    },
++    {
++      "type": "state-timeline",
++      "title": "Breaker state",
++      "id": 79,
++      "datasource": {
++        "type": "prometheus",
++        "uid": "${datasource}"
++      },
++      "description": "0 closed, 1 half-open, 2 open. Agent-tool DB breakers here are the API process's, not the tool server's.",
++      "gridPos": {
++        "h": 8,
++        "w": 24,
++        "x": 0,
++        "y": 226
++      },
++      "targets": [
++        {
++          "datasource": {
++            "type": "prometheus",
++            "uid": "${datasource}"
++          },
++          "expr": "max by (breaker) (agentic_resident_crm_breaker_state{namespace=~\"$namespace\", instance=~\"$instance\"})",
++          "legendFormat": "{{breaker}}",
++          "refId": "A"
++        }
++      ],
++      "fieldConfig": {
++        "defaults": {
++          "custom": {
++            "fillOpacity": 80,
++            "lineWidth": 0
++          },
++          "color": {
++            "mode": "thresholds"
++          },
++          "thresholds": {
++            "mode": "absolute",
++            "steps": [
++              {
++                "color": "green",
++                "value": null
++              },
++              {
++                "color": "orange",
++                "value": 1
++              },
++              {
++                "color": "red",
++                "value": 2
++              }
++            ]
++          },
++          "mappings": [
++            {
++              "type": "value",
++              "options": {
++                "0": {
++                  "text": "closed",
++                  "color": "green",
++                  "index": 0
++                },
++                "1": {
++                  "text": "half-open",
++                  "color": "orange",
++                  "index": 1
++                },
++                "2": {
++                  "text": "open",
++                  "color": "red",
++                  "index": 2
++                }
++              }
++            }
++          ]
++        },
++        "overrides": []
++      },
++      "options": {
++        "showValue": "never",
++        "mergeValues": true,
++        "rowHeight": 0.8,
++        "legend": {
++          "displayMode": "list",
++          "placement": "bottom",
++          "showLegend": true
++        },
++        "tooltip": {
++          "mode": "single"
++        }
++      }
++    },
++    {
++      "type": "row",
++      "title": "DLT lane",
++      "id": 80,
+       "collapsed": true,
+       "gridPos": {
+         "h": 1,
+         "w": 24,
+         "x": 0,
+-        "y": 205
++        "y": 234
+       },
+       "panels": [
+         {
+           "type": "timeseries",
+           "title": "DLT cases / min by failure class",
+-          "id": 73,
++          "id": 81,
+           "datasource": {
+             "type": "prometheus",
+             "uid": "${datasource}"
+@@ -4178,7 +4642,7 @@
+             "h": 8,
+             "w": 12,
+             "x": 0,
+-            "y": 206
++            "y": 235
+           },
+           "targets": [
+             {
+@@ -4228,7 +4692,7 @@
+         {
+           "type": "piechart",
+           "title": "Reuse decisions (range)",
+-          "id": 74,
++          "id": 82,
+           "datasource": {
+             "type": "prometheus",
+             "uid": "${datasource}"
+@@ -4238,7 +4702,7 @@
+             "h": 8,
+             "w": 6,
+             "x": 12,
+-            "y": 206
++            "y": 235
+           },
+           "targets": [
+             {
+@@ -4288,7 +4752,7 @@
+         {
+           "type": "piechart",
+           "title": "Code-check verdicts (range)",
+-          "id": 75,
++          "id": 83,
+           "datasource": {
+             "type": "prometheus",
+             "uid": "${datasource}"
+@@ -4298,7 +4762,7 @@
+             "h": 8,
+             "w": 6,
+             "x": 18,
+-            "y": 206
++            "y": 235
+           },
+           "targets": [
+             {
+@@ -4348,7 +4812,7 @@
+         {
+           "type": "timeseries",
+           "title": "Corroboration verdicts / min",
+-          "id": 76,
++          "id": 84,
+           "datasource": {
+             "type": "prometheus",
+             "uid": "${datasource}"
+@@ -4358,7 +4822,7 @@
+             "h": 8,
+             "w": 12,
+             "x": 0,
+-            "y": 214
++            "y": 243
+           },
+           "targets": [
+             {
+@@ -4408,7 +4872,7 @@
+         {
+           "type": "timeseries",
+           "title": "Single-flight outcomes / min",
+-          "id": 77,
++          "id": 85,
+           "datasource": {
+             "type": "prometheus",
+             "uid": "${datasource}"
+@@ -4418,7 +4882,7 @@
+             "h": 8,
+             "w": 12,
+             "x": 12,
+-            "y": 214
++            "y": 243
+           },
+           "targets": [
+             {
+@@ -4468,7 +4932,7 @@
+         {
+           "type": "timeseries",
+           "title": "DLT claims / min",
+-          "id": 78,
++          "id": 86,
+           "datasource": {
+             "type": "prometheus",
+             "uid": "${datasource}"
+@@ -4478,7 +4942,7 @@
+             "h": 8,
+             "w": 12,
+             "x": 0,
+-            "y": 222
++            "y": 251
+           },
+           "targets": [
+             {
+@@ -4528,7 +4992,7 @@
+         {
+           "type": "timeseries",
+           "title": "Group writes / min by operation and outcome",
+-          "id": 79,
++          "id": 87,
+           "datasource": {
+             "type": "prometheus",
+             "uid": "${datasource}"
+@@ -4538,7 +5002,7 @@
+             "h": 8,
+             "w": 12,
+             "x": 12,
+-            "y": 222
++            "y": 251
+           },
+           "targets": [
+             {
+@@ -4588,7 +5052,7 @@
+         {
+           "type": "timeseries",
+           "title": "Service resolutions / min by source",
+-          "id": 80,
++          "id": 88,
+           "datasource": {
+             "type": "prometheus",
+             "uid": "${datasource}"
+@@ -4598,7 +5062,7 @@
+             "h": 8,
+             "w": 12,
+             "x": 0,
+-            "y": 230
++            "y": 259
+           },
+           "targets": [
+             {
+@@ -4648,7 +5112,7 @@
+         {
+           "type": "timeseries",
+           "title": "DLT skipped / min (gate=enforce)",
+-          "id": 81,
++          "id": 89,
+           "datasource": {
+             "type": "prometheus",
+             "uid": "${datasource}"
+@@ -4658,7 +5122,7 @@
+             "h": 8,
+             "w": 12,
+             "x": 12,
+-            "y": 230
++            "y": 259
+           },
+           "targets": [
+             {
+@@ -4708,7 +5172,7 @@
+         {
+           "type": "timeseries",
+           "title": "Auto-replay outcomes / min",
+-          "id": 82,
++          "id": 90,
+           "datasource": {
+             "type": "prometheus",
+             "uid": "${datasource}"
+@@ -4718,7 +5182,7 @@
+             "h": 8,
+             "w": 12,
+             "x": 0,
+-            "y": 238
++            "y": 267
+           },
+           "targets": [
+             {
+@@ -4768,7 +5232,7 @@
+         {
+           "type": "timeseries",
+           "title": "Deployed-version reads / min",
+-          "id": 83,
++          "id": 91,
+           "datasource": {
+             "type": "prometheus",
+             "uid": "${datasource}"
+@@ -4778,7 +5242,7 @@
+             "h": 8,
+             "w": 12,
+             "x": 12,
+-            "y": 238
++            "y": 267
+           },
+           "targets": [
+             {
+@@ -4828,7 +5292,7 @@
+         {
+           "type": "timeseries",
+           "title": "Log window age at fetch (p50 / p95)",
+-          "id": 84,
++          "id": 92,
+           "datasource": {
+             "type": "prometheus",
+             "uid": "${datasource}"
+@@ -4838,7 +5302,7 @@
+             "h": 8,
+             "w": 12,
+             "x": 0,
+-            "y": 246
++            "y": 275
+           },
+           "targets": [
+             {
+@@ -4897,7 +5361,7 @@
+         {
+           "type": "timeseries",
+           "title": "Registry misses and per-code violations / hour",
+-          "id": 85,
++          "id": 93,
+           "datasource": {
+             "type": "prometheus",
+             "uid": "${datasource}"
+@@ -4907,7 +5371,7 @@
+             "h": 8,
+             "w": 12,
+             "x": 12,
+-            "y": 246
++            "y": 275
+           },
+           "targets": [
+             {
