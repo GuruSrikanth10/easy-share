@@ -1,0 +1,2056 @@
+diff --git a/src/utils/kafkaConsumer.py b/src/utils/kafkaConsumer.py
+index 6aba237..9cfd9c7 100644
+--- a/src/utils/kafkaConsumer.py
++++ b/src/utils/kafkaConsumer.py
+@@ -489,8 +489,8 @@ def _handle_one_message(tp, msg):
+     # had failed -- but it logged two failures for one message and doubled the
+     # work against a broker already known to be unreachable.
+     dlq_attempted = False
+-    # How the message is counted in metrics.MESSAGES_CONSUMED; None when it
+-    # left through the error handler.
++    # How the message is counted in metrics.MESSAGES_CONSUMED and by the
++    # adapter; None when it left through the error handler.
+     outcome = None
+ 
+     # Track only this message's offset, never the whole polled batch -- a bare
+@@ -569,6 +569,7 @@ def _handle_one_message(tp, msg):
+             _queue_semaphore.release()
+         metrics.record_message_consumed(CONSUMER_ROLE, getattr(msg, "topic", None),
+                                         outcome or "error")
++        _adapter.count_received(signal_payload, outcome or "error")
+ 
+ 
+ class _RebalanceListener(ConsumerRebalanceListener):
+diff --git a/src/utils/message_adapters.py b/src/utils/message_adapters.py
+index 05b07a9..4a72360 100644
+--- a/src/utils/message_adapters.py
++++ b/src/utils/message_adapters.py
+@@ -2,15 +2,16 @@
+ 
+ `kafkaConsumer.py` is role-agnostic in everything that matters -- offset
+ tracking, the rebalance listener, the worker semaphore, heartbeats, the
+-shutdown drain. Only four things differ between a rejection message and a
++shutdown drain. Only five things differ between a rejection message and a
+ dead-lettered one:
+ 
+     what makes it valid   MessagePayload vs a DLT case
+     what makes it skippable   packetStatus, or a terminal case already on disk
+     what identifies it        eventId vs case_id
+     what gets POSTed          the payload, or headers + payload + case_id
++    what it counts            rejections and ON_HOLD records vs nothing
+ 
+-Those four move here. `RejectionAdapter` is today's logic *moved, not rewritten*
++Those five move here. `RejectionAdapter` is today's logic *moved, not rewritten*
+ -- same validation, same REJECTED filter, same terminal-casebook dedupe, same
+ raw-string DLQ payload on a poison pill -- so the live rejection path is
+ provably unchanged.
+@@ -25,6 +26,7 @@ import json
+ from dataclasses import dataclass
+ from typing import Optional, Protocol
+ 
++from src.utils import metrics
+ from src.utils.logging_config import get_logger
+ 
+ logger = get_logger(__name__)
+@@ -94,6 +96,13 @@ class MessageAdapter(Protocol):
+         passed the casebook contract (src/models/unified_casebook.py)."""
+         ...
+ 
++    def count_received(self, body: Optional[dict], outcome: str) -> None:
++        """Count a message this role read: its body, None when it did not
++        parse, and how the consumer left it (an outcome of
++        metrics.MESSAGES_CONSUMED). Must never raise: it runs on the way out
++        of every message."""
++        ...
++
+ 
+ # ---------------------------------------------------------------------------
+ # Rejections -- today's behaviour, moved verbatim
+@@ -109,6 +118,11 @@ class RejectionAdapter:
+ 
+     role = "rejection"
+ 
++    def __init__(self, counts_received: bool = False):
++        # Only the fast consumer counts what it receives: the slow one reads
++        # the same packets again off the analysis queue.
++        self.counts_received = counts_received
++
+     def parse(self, msg) -> ParseResult:
+         payload = msg.value.decode("utf-8", errors="replace")
+         try:
+@@ -162,6 +176,36 @@ class RejectionAdapter:
+         save_casebook(get_casebook_storage(), identity, casebook)
+         cleanup_casebook_dir(identity)
+ 
++    def count_received(self, body: Optional[dict], outcome: str) -> None:
++        """Count a packet read off the rejections topic by its packetStatus: a
++        rejection with what became of it, an ON_HOLD record by its service
++        alone, since it is always skipped."""
++        if not self.counts_received or not isinstance(body, dict):
++            return
++        from src.models.audit_contract import STATUS_ON_HOLD, STATUS_REJECTED
++
++        summary = body.get("packetExecutionSummary")
++        status = summary.get("packetStatus") if isinstance(summary, dict) else None
++        if status == STATUS_ON_HOLD:
++            metrics.record_on_hold_packet_received(_service_of(body))
++        elif status == STATUS_REJECTED:
++            # A rejection is skipped only when its casebook is already finished.
++            metrics.record_rejection_packet_received(
++                _service_of(body), SKIP_LABELS[SKIP_TERMINAL] if outcome == "skipped" else outcome)
++
++
++def _service_of(body: dict) -> str:
++    """The service a packet belongs to, by the rules the fetch stage resolves
++    it with, or `unknown` when they could not be applied."""
++    try:
++        from src.utils import service_registry
++
++        return service_registry.resolve(body).service
++    except Exception as error:
++        logger.debug("Could not resolve a packet's service to count it under",
++                     error=f"{type(error).__name__}: {error}")
++        return "unknown"
++
+ 
+ # ---------------------------------------------------------------------------
+ # Dead-letter topic
+@@ -319,10 +363,13 @@ class DltAdapter:
+         save_casebook(get_dlt_storage(), identity, casebook)
+         cleanup_casebook_dir(identity)
+ 
++    def count_received(self, body: Optional[dict], outcome: str) -> None:
++        """Nothing: the DLT lane's records are counted in its own metrics."""
++
+ 
+ def for_role(role: str) -> MessageAdapter:
+     """Adapter for a `CONSUMER_ROLE`. Unknown roles get the rejection adapter,
+     matching the module's existing default-to-fast behaviour."""
+     if role in ("dlt", "dlt_analysis"):
+         return DltAdapter()
+-    return RejectionAdapter()
++    return RejectionAdapter(counts_received=role != "slow")
+diff --git a/src/utils/metrics.py b/src/utils/metrics.py
+index 46e124e..1ea5d73 100644
+--- a/src/utils/metrics.py
++++ b/src/utils/metrics.py
+@@ -128,7 +128,9 @@ MESSAGES_CONSUMED = _counter(
+     "topic and outcome: dispatched (forwarded to the API), skipped (see "
+     "messages_skipped_total for why), poison (failed validation and was "
+     "dead-lettered) or error (a consumer-side fault; dead-lettered). The "
+-    "fast role's count is the rejection lane's intake.",
++    "fast role's count includes the ON_HOLD records the rejections topic "
++    "carries: rejection_packets_received_total and "
++    "on_hold_packets_received_total count the two apart.",
+     ("role", "topic", "outcome"),
+ )
+ 
+@@ -141,6 +143,30 @@ MESSAGES_SKIPPED = _counter(
+     ("role", "reason"),
+ )
+ 
++# The rejection lane's intake, by the packet's status. Counted where the fast
++# consumer reads it, since an ON_HOLD record and a redelivery of a finished
++# packet go no further.
++REJECTION_PACKETS_RECEIVED = _counter(
++    "agentic_resident_crm_rejection_packets_received_total",
++    "Rejected packets the fast consumer read off the rejections topic, one "
++    "per message (a redelivery counts again), by service and outcome: "
++    "dispatched (sent on to the fetch stage), already_terminal (its casebook "
++    "is already finished) or error (a consumer-side fault; dead-lettered). "
++    "The service is resolved by the fetch stage's rules: _unresolved when "
++    "none applies, unknown when they could not be applied. A message that "
++    "failed validation has no status, and is counted in neither this nor "
++    "on_hold_packets_received_total.",
++    ("service", "outcome"),
++)
++
++ON_HOLD_PACKETS_RECEIVED = _counter(
++    "agentic_resident_crm_on_hold_packets_received_total",
++    "ON_HOLD (dead-lettered) packets the fast consumer read off the "
++    "rejections topic, one per message, by service. The rejection lane skips "
++    "them; the DLT lane analyses them from the dead-letter topic.",
++    ("service",),
++)
++
+ FETCH_STAGE_PACKETS = _counter(
+     "agentic_resident_crm_fetch_stage_packets_total",
+     "Packets the fetch stage received (POST /get-logs, /get-dlt-logs), by "
+@@ -484,6 +510,16 @@ def record_message_skipped(role: str, reason: str) -> None:
+     MESSAGES_SKIPPED.labels(role=role, reason=reason).inc()
+ 
+ 
++@_never_raises
++def record_rejection_packet_received(service: Optional[str], outcome: str) -> None:
++    REJECTION_PACKETS_RECEIVED.labels(service=service or "unknown", outcome=outcome).inc()
++
++
++@_never_raises
++def record_on_hold_packet_received(service: Optional[str]) -> None:
++    ON_HOLD_PACKETS_RECEIVED.labels(service=service or "unknown").inc()
++
++
+ @_never_raises
+ def record_fetch_stage_packet(lane: str, service: Optional[str],
+                               enabled: Optional[bool], outcome: Optional[str]) -> None:
+diff --git a/tests/test_dependency_and_intake_metrics.py b/tests/test_dependency_and_intake_metrics.py
+index d5f624a..a15df64 100644
+--- a/tests/test_dependency_and_intake_metrics.py
++++ b/tests/test_dependency_and_intake_metrics.py
+@@ -428,6 +428,99 @@ def test_the_fetch_stage_counts_a_request_that_failed(fetch_stage, monkeypatch):
+     assert dict(labels)["service"] != "unknown", "it failed after its service was resolved"
+ 
+ 
++# ======================================================================
++# The rejection lane's intake, by status
++# ======================================================================
++
++AUDIT = ROOT / "tests" / "fixtures" / "audit"
++# Where _packet's reason code places it.
++SERVICE = "enu-biometric"
++
++
++def _received(act) -> tuple:
++    """The rejections and the ON_HOLD records `act()` counted."""
++    rejections = {}
++    on_hold = _increments(metrics.ON_HOLD_PACKETS_RECEIVED,
++                          lambda: rejections.update(
++                              _increments(metrics.REJECTION_PACKETS_RECEIVED, act)))
++    return rejections, on_hold
++
++
++def _rejection(service, outcome):
++    return (("outcome", outcome), ("service", service))
++
++
++@pytest.mark.parametrize("exists, outcome", [
++    (False, "dispatched"),
++    (True, "already_terminal"),
++    (OSError("storage unreachable"), "error"),
++])
++def test_a_rejection_is_counted_under_its_service_by_what_became_of_it(exists, outcome):
++    packet = json.dumps(_packet("evt-received")).encode("utf-8")
++
++    assert _received(lambda: _consume(packet, exists=exists)) == (
++        {_rejection(SERVICE, outcome): 1}, {})
++
++
++def test_an_on_hold_record_is_counted_apart_from_the_rejections():
++    packet = json.dumps(_packet("evt-held", "ON_HOLD")).encode("utf-8")
++
++    assert _received(lambda: _consume(packet)) == ({}, {(("service", SERVICE),): 1})
++
++
++@pytest.mark.parametrize("value", [
++    json.dumps(_packet("evt-other", "PROCESSED")).encode("utf-8"),
++    b"{not json",  # no status to count it by
++], ids=["not_rejected", "poison"])
++def test_a_message_neither_rejected_nor_on_hold_is_not_counted(value):
++    assert _received(lambda: _consume(value)) == ({}, {})
++
++
++@pytest.mark.parametrize("sample, rejections, on_hold", [
++    ("rejection_sample.json", 1, 0),
++    ("dlt_sample.json", 0, 1),
++])
++def test_the_audit_samples_are_counted_by_their_execution_status(sample, rejections, on_hold):
++    counted = _received(lambda: _consume((AUDIT / sample).read_bytes()))
++
++    assert tuple(sum(moved.values()) for moved in counted) == (rejections, on_hold)
++
++
++def test_a_rejection_is_counted_under_the_service_the_fetch_stage_gives_it(fetch_stage):
++    from src.api.routes import fetch_logs
++
++    packet = _packet("evt-same-service")
++    rejections, _ = _received(lambda: _consume(json.dumps(packet).encode("utf-8")))
++    fetched = _increments(metrics.FETCH_STAGE_PACKETS,
++                          lambda: fetch_logs(MessagePayload(**packet)))
++
++    assert {dict(labels)["service"] for labels in rejections} == \
++        {dict(labels)["service"] for labels in fetched} == {SERVICE}
++
++
++def test_the_slow_consumer_does_not_count_the_packets_again(monkeypatch):
++    import src.utils.kafkaConsumer as kc
++    from src.utils.message_adapters import for_role
++
++    monkeypatch.setattr(kc, "_adapter", for_role("slow"))
++    packet = json.dumps(_packet("evt-queued")).encode("utf-8")
++
++    assert _received(lambda: _consume(packet)) == ({}, {})
++
++
++def test_a_service_that_cannot_be_resolved_is_counted_as_unknown(monkeypatch):
++    from src.utils import service_registry
++
++    monkeypatch.setattr(service_registry, "resolve",
++                        MagicMock(side_effect=RuntimeError("registry unreadable")))
++    packet = json.dumps(_packet("evt-unplaced")).encode("utf-8")
++    pools = []
++
++    assert _received(lambda: pools.append(_consume(packet))) == (
++        {_rejection("unknown", "dispatched"): 1}, {})
++    pools[0].submit.assert_called_once()
++
++
+ # ======================================================================
+ # Each packet's log fetch
+ # ======================================================================
+diff --git a/tools/grafana/README.md b/tools/grafana/README.md
+index 03a52dc..ebf6c7e 100644
+--- a/tools/grafana/README.md
++++ b/tools/grafana/README.md
+@@ -36,12 +36,18 @@ packet is processed.
+ 
+ ## Reading it
+ 
+-- The third line of the overview counts the intake: rejections the fast
+-  consumer read, packets skipped (by a consumer, or by the service gate in
+-  `enforce` mode), packets for services the gate admits, and how each
+-  packet's log fetch went. Pick a service at the top to count one.
++- The third line of the overview is the rejection lane's intake. The
++  rejections topic carries ON_HOLD records as well as rejections, and the
++  fast consumer counts the two apart (*Rejections received*, *On-hold
++  received*), each under the service the fetch stage's rules place it in.
++  Then come rejections skipped (a redelivery of a finished packet, or a
++  service the gate skips in `enforce` mode), rejections for services the
++  gate admits, and how each packet's log fetch went. Pick a service at the
++  top to count one. The fourth line has the S3 and MySQL error shares.
++- The received counts are the fast consumer's, so on Windows, where its
++  metrics are not reported, they stay at 0.
+ - *Packet intake* is per consumer role (`fast`, `slow`, `dlt`,
+-  `dlt_analysis`) and, from the fetch stage on, per service.
++  `dlt_analysis`) and, from the fetch stage on, per lane and service.
+ - *Log pipeline* counts each packet's fetch by how it went (`fetched`,
+   `no_logs`, `failed`, `breaker_open`, `error`, `not_searched`, `disabled`)
+   before the per-source panels.
+diff --git a/tools/grafana/build_dashboard.py b/tools/grafana/build_dashboard.py
+index 8c34557..249a1e0 100644
+--- a/tools/grafana/build_dashboard.py
++++ b/tools/grafana/build_dashboard.py
+@@ -211,15 +211,20 @@ share("Log fetch failure share",
+       desc="Per source fetch. The per-packet count is in the Log pipeline row.")
+ stat("DLT cases", f"round({inc('dlt_cases_total')} or vector(0))", w=4)
+ flush()
+-stat("Packets consumed", f"round({inc('messages_consumed_total', INST + ', role=\"fast\"')} or vector(0))",
+-     desc="Read from the rejections topic by the fast consumer, whatever happened to them next.")
+-stat("Packets skipped",
+-     f"round(({inc('messages_skipped_total')} or vector(0)) + ({inc('rejections_skipped_total', PS)} or vector(0)))",
+-     desc="Acknowledged without analysis: by a consumer (ON_HOLD, not REJECTED, already terminal) "
+-          "or by the service gate (REJECTION_SERVICE_GATE=enforce only).")
+-stat("Packets for enabled services",
+-     f"round({inc('fetch_stage_packets_total', PS + ', enabled=\"true\"')} or vector(0))",
+-     desc="Received by the fetch stage for a service the gate admits. Pick a service at the top to count one.")
++stat("Rejections received", f"round({inc('rejection_packets_received_total', PS)} or vector(0))",
++     desc="Rejected packets the fast consumer read off the rejections topic, one per message: a "
++          "redelivery counts again. Pick a service at the top to count one.")
++stat("On-hold received", f"round({inc('on_hold_packets_received_total', PS)} or vector(0))",
++     desc="ON_HOLD records on the rejections topic. The rejection lane skips them; the DLT lane "
++          "analyses them from the dead-letter topic.")
++stat("Rejections skipped",
++     f"round(({inc('rejection_packets_received_total', PS + ', outcome=\"already_terminal\"')} or vector(0)) "
++     f"+ ({inc('rejections_skipped_total', PS)} or vector(0)))",
++     desc="Rejections acknowledged without analysis: a redelivery of a packet already finished, "
++          "or a service the gate skips (REJECTION_SERVICE_GATE=enforce only).")
++stat("Rejections for enabled services",
++     f"round({inc('fetch_stage_packets_total', PS + ', lane=\"rejection\", enabled=\"true\"')} or vector(0))",
++     desc="Rejections the fetch stage received for a service the gate admits. Pick a service at the top to count one.")
+ stat("Packets with logs fetched",
+      f"round({inc('packet_log_fetches_total', PS + ', outcome=\"fetched\"')} or vector(0))",
+      desc="Fetches whose trace held lines, one per attempt.")
+@@ -227,6 +232,7 @@ stat("Log fetch failures",
+      f"round({inc('packet_log_fetches_total', PS + ', ' + FETCH_FAILED)} or vector(0))",
+      thresholds=[GREEN, red(1)],
+      desc="No source could be read, the breaker was open, or the pipeline raised.")
++flush()
+ share("S3 error share",
+       f"({inc('dependency_requests_total', S3 + S3_FAILED)} or vector(0)) / {inc('dependency_requests_total', S3)}",
+       decimals=2, thresholds=[GREEN, amber(0.01), red(0.05)],
+@@ -240,19 +246,31 @@ flush()
+ 
+ # ---------------------------------------------------------------- Intake
+ row("Packet intake: Kafka consumers and fetch stage")
++ts("Rejections received / min by service and outcome",
++   [(r("rejection_packets_received_total", PS, "service, outcome", " * 60"), "{{service}} {{outcome}}")],
++   stack=True,
++   desc="Rejected packets the fast consumer read off the rejections topic. dispatched: sent on to the "
++        "fetch stage. already_terminal: a redelivery of a finished packet. error: dead-lettered. "
++        "_unresolved: no rule placed it in a service.")
++ts("On-hold received / min by service",
++   [(r("on_hold_packets_received_total", PS, "service", " * 60"), "{{service}}")], stack=True,
++   desc="ON_HOLD records on the rejections topic, which the rejection lane skips.")
+ ts("Messages consumed / min by role and outcome",
+    [(r("messages_consumed_total", INST, "role, outcome", " * 60"), "{{role}} {{outcome}}")], stack=True,
+-   desc="fast: the rejections topic. slow: the analysis queue. dlt, dlt_analysis: the DLT lane. "
++   desc="fast: the rejections topic, ON_HOLD records included (skipped). slow: the analysis queue. "
++        "dlt, dlt_analysis: the DLT lane. "
+         "Counted in the consumers; reported through start.py's metrics directory, so not on Windows.")
+ ts("Messages skipped / min by role and reason",
+    [(r("messages_skipped_total", INST, "role, reason", " * 60"), "{{role}} {{reason}}")], stack=True,
+    desc="on_hold: dead-lettered, analysed by the DLT lane. not_rejected: packetStatus is not REJECTED. "
+         "already_terminal: a redelivery of a finished packet.")
+-bars("Packets by service (range)", inc("fetch_stage_packets_total", PS, "service, enabled"),
+-     "{{service}} (enabled={{enabled}})",
+-     desc="Every packet the fetch stage received, by its service and whether the service gate admits it.")
+-ts("Fetch stage / min by service and outcome",
+-   [(r("fetch_stage_packets_total", PS, "service, outcome", " * 60"), "{{service}} {{outcome}}")], stack=True,
++bars("Packets by lane and service (range)", inc("fetch_stage_packets_total", PS, "lane, service, enabled"),
++     "{{lane}} {{service}} (enabled={{enabled}})",
++     desc="Every packet the fetch stage received, by lane (rejection, or dlt for a dead-lettered record), "
++          "service and whether that lane's service gate admits it.")
++ts("Fetch stage / min by lane, service and outcome",
++   [(r("fetch_stage_packets_total", PS, "lane, service, outcome", " * 60"), "{{lane}} {{service}} {{outcome}}")],
++   stack=True,
+    desc="queued_for_analysis, skipped (gate=enforce), already_processed, error (the consumer dead-letters it).")
+ ts("Forwards to the API / min by endpoint and outcome",
+    [(r("dependency_requests_total", API, "operation, outcome", " * 60"), "{{operation}} {{outcome}}")],
+diff --git a/tools/grafana/packet-crm-dashboard.json b/tools/grafana/packet-crm-dashboard.json
+index 2bb2438..7b3112d 100644
+--- a/tools/grafana/packet-crm-dashboard.json
++++ b/tools/grafana/packet-crm-dashboard.json
+@@ -947,13 +947,13 @@
+     },
+     {
+       "type": "stat",
+-      "title": "Packets consumed",
++      "title": "Rejections received",
+       "id": 14,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+       },
+-      "description": "Read from the rejections topic by the fast consumer, whatever happened to them next.",
++      "description": "Rejected packets the fast consumer read off the rejections topic, one per message: a redelivery counts again. Pick a service at the top to count one.",
+       "gridPos": {
+         "h": 4,
+         "w": 4,
+@@ -966,7 +966,7 @@
+             "type": "prometheus",
+             "uid": "${datasource}"
+           },
+-          "expr": "round(sum (increase(agentic_resident_crm_messages_consumed_total{namespace=~\"$namespace\", instance=~\"$instance\", role=\"fast\"}[$__range])) or vector(0))",
++          "expr": "round(sum (increase(agentic_resident_crm_rejection_packets_received_total{namespace=~\"$namespace\", instance=~\"$instance\", service=~\"$service\"}[$__range])) or vector(0))",
+           "legendFormat": "__auto",
+           "refId": "A",
+           "instant": true,
+@@ -1008,13 +1008,13 @@
+     },
+     {
+       "type": "stat",
+-      "title": "Packets skipped",
++      "title": "On-hold received",
+       "id": 15,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+       },
+-      "description": "Acknowledged without analysis: by a consumer (ON_HOLD, not REJECTED, already terminal) or by the service gate (REJECTION_SERVICE_GATE=enforce only).",
++      "description": "ON_HOLD records on the rejections topic. The rejection lane skips them; the DLT lane analyses them from the dead-letter topic.",
+       "gridPos": {
+         "h": 4,
+         "w": 4,
+@@ -1027,7 +1027,7 @@
+             "type": "prometheus",
+             "uid": "${datasource}"
+           },
+-          "expr": "round((sum (increase(agentic_resident_crm_messages_skipped_total{namespace=~\"$namespace\", instance=~\"$instance\"}[$__range])) or vector(0)) + (sum (increase(agentic_resident_crm_rejections_skipped_total{namespace=~\"$namespace\", instance=~\"$instance\", service=~\"$service\"}[$__range])) or vector(0)))",
++          "expr": "round(sum (increase(agentic_resident_crm_on_hold_packets_received_total{namespace=~\"$namespace\", instance=~\"$instance\", service=~\"$service\"}[$__range])) or vector(0))",
+           "legendFormat": "__auto",
+           "refId": "A",
+           "instant": true,
+@@ -1069,13 +1069,13 @@
+     },
+     {
+       "type": "stat",
+-      "title": "Packets for enabled services",
++      "title": "Rejections skipped",
+       "id": 16,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+       },
+-      "description": "Received by the fetch stage for a service the gate admits. Pick a service at the top to count one.",
++      "description": "Rejections acknowledged without analysis: a redelivery of a packet already finished, or a service the gate skips (REJECTION_SERVICE_GATE=enforce only).",
+       "gridPos": {
+         "h": 4,
+         "w": 4,
+@@ -1088,7 +1088,7 @@
+             "type": "prometheus",
+             "uid": "${datasource}"
+           },
+-          "expr": "round(sum (increase(agentic_resident_crm_fetch_stage_packets_total{namespace=~\"$namespace\", instance=~\"$instance\", service=~\"$service\", enabled=\"true\"}[$__range])) or vector(0))",
++          "expr": "round((sum (increase(agentic_resident_crm_rejection_packets_received_total{namespace=~\"$namespace\", instance=~\"$instance\", service=~\"$service\", outcome=\"already_terminal\"}[$__range])) or vector(0)) + (sum (increase(agentic_resident_crm_rejections_skipped_total{namespace=~\"$namespace\", instance=~\"$instance\", service=~\"$service\"}[$__range])) or vector(0)))",
+           "legendFormat": "__auto",
+           "refId": "A",
+           "instant": true,
+@@ -1130,19 +1130,80 @@
+     },
+     {
+       "type": "stat",
+-      "title": "Packets with logs fetched",
++      "title": "Rejections for enabled services",
+       "id": 17,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+       },
+-      "description": "Fetches whose trace held lines, one per attempt.",
++      "description": "Rejections the fetch stage received for a service the gate admits. Pick a service at the top to count one.",
+       "gridPos": {
+         "h": 4,
+         "w": 4,
+         "x": 12,
+         "y": 9
+       },
++      "targets": [
++        {
++          "datasource": {
++            "type": "prometheus",
++            "uid": "${datasource}"
++          },
++          "expr": "round(sum (increase(agentic_resident_crm_fetch_stage_packets_total{namespace=~\"$namespace\", instance=~\"$instance\", service=~\"$service\", lane=\"rejection\", enabled=\"true\"}[$__range])) or vector(0))",
++          "legendFormat": "__auto",
++          "refId": "A",
++          "instant": true,
++          "range": false
++        }
++      ],
++      "fieldConfig": {
++        "defaults": {
++          "unit": "short",
++          "thresholds": {
++            "mode": "absolute",
++            "steps": [
++              {
++                "color": "green",
++                "value": null
++              }
++            ]
++          },
++          "color": {
++            "mode": "thresholds"
++          }
++        },
++        "overrides": []
++      },
++      "options": {
++        "reduceOptions": {
++          "calcs": [
++            "lastNotNull"
++          ],
++          "fields": "",
++          "values": false
++        },
++        "colorMode": "background",
++        "graphMode": "none",
++        "textMode": "auto",
++        "justifyMode": "auto",
++        "orientation": "auto"
++      }
++    },
++    {
++      "type": "stat",
++      "title": "Packets with logs fetched",
++      "id": 18,
++      "datasource": {
++        "type": "prometheus",
++        "uid": "${datasource}"
++      },
++      "description": "Fetches whose trace held lines, one per attempt.",
++      "gridPos": {
++        "h": 4,
++        "w": 4,
++        "x": 16,
++        "y": 9
++      },
+       "targets": [
+         {
+           "datasource": {
+@@ -1192,7 +1253,7 @@
+     {
+       "type": "stat",
+       "title": "Log fetch failures",
+-      "id": 18,
++      "id": 19,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -1201,7 +1262,7 @@
+       "gridPos": {
+         "h": 4,
+         "w": 4,
+-        "x": 16,
++        "x": 20,
+         "y": 9
+       },
+       "targets": [
+@@ -1257,7 +1318,7 @@
+     {
+       "type": "stat",
+       "title": "S3 error share",
+-      "id": 19,
++      "id": 20,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -1266,8 +1327,8 @@
+       "gridPos": {
+         "h": 4,
+         "w": 4,
+-        "x": 20,
+-        "y": 9
++        "x": 0,
++        "y": 13
+       },
+       "targets": [
+         {
+@@ -1329,7 +1390,7 @@
+     {
+       "type": "stat",
+       "title": "MySQL error share",
+-      "id": 20,
++      "id": 21,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -1338,7 +1399,7 @@
+       "gridPos": {
+         "h": 4,
+         "w": 4,
+-        "x": 0,
++        "x": 4,
+         "y": 13
+       },
+       "targets": [
+@@ -1401,7 +1462,7 @@
+     {
+       "type": "row",
+       "title": "Packet intake: Kafka consumers and fetch stage",
+-      "id": 21,
++      "id": 22,
+       "collapsed": false,
+       "gridPos": {
+         "h": 1,
+@@ -1413,19 +1474,139 @@
+     },
+     {
+       "type": "timeseries",
+-      "title": "Messages consumed / min by role and outcome",
+-      "id": 22,
++      "title": "Rejections received / min by service and outcome",
++      "id": 23,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+       },
+-      "description": "fast: the rejections topic. slow: the analysis queue. dlt, dlt_analysis: the DLT lane. Counted in the consumers; reported through start.py's metrics directory, so not on Windows.",
++      "description": "Rejected packets the fast consumer read off the rejections topic. dispatched: sent on to the fetch stage. already_terminal: a redelivery of a finished packet. error: dead-lettered. _unresolved: no rule placed it in a service.",
+       "gridPos": {
+         "h": 8,
+         "w": 12,
+         "x": 0,
+         "y": 18
+       },
++      "targets": [
++        {
++          "datasource": {
++            "type": "prometheus",
++            "uid": "${datasource}"
++          },
++          "expr": "sum by (service, outcome) (rate(agentic_resident_crm_rejection_packets_received_total{namespace=~\"$namespace\", instance=~\"$instance\", service=~\"$service\"}[$__rate_interval])) * 60",
++          "legendFormat": "{{service}} {{outcome}}",
++          "refId": "A"
++        }
++      ],
++      "fieldConfig": {
++        "defaults": {
++          "unit": "short",
++          "custom": {
++            "drawStyle": "line",
++            "lineWidth": 1,
++            "fillOpacity": 15,
++            "showPoints": "never",
++            "spanNulls": false,
++            "stacking": {
++              "mode": "normal",
++              "group": "A"
++            }
++          }
++        },
++        "overrides": []
++      },
++      "options": {
++        "legend": {
++          "displayMode": "table",
++          "placement": "right",
++          "calcs": [
++            "mean",
++            "max",
++            "lastNotNull"
++          ],
++          "showLegend": true
++        },
++        "tooltip": {
++          "mode": "multi",
++          "sort": "desc"
++        }
++      }
++    },
++    {
++      "type": "timeseries",
++      "title": "On-hold received / min by service",
++      "id": 24,
++      "datasource": {
++        "type": "prometheus",
++        "uid": "${datasource}"
++      },
++      "description": "ON_HOLD records on the rejections topic, which the rejection lane skips.",
++      "gridPos": {
++        "h": 8,
++        "w": 12,
++        "x": 12,
++        "y": 18
++      },
++      "targets": [
++        {
++          "datasource": {
++            "type": "prometheus",
++            "uid": "${datasource}"
++          },
++          "expr": "sum by (service) (rate(agentic_resident_crm_on_hold_packets_received_total{namespace=~\"$namespace\", instance=~\"$instance\", service=~\"$service\"}[$__rate_interval])) * 60",
++          "legendFormat": "{{service}}",
++          "refId": "A"
++        }
++      ],
++      "fieldConfig": {
++        "defaults": {
++          "unit": "short",
++          "custom": {
++            "drawStyle": "line",
++            "lineWidth": 1,
++            "fillOpacity": 15,
++            "showPoints": "never",
++            "spanNulls": false,
++            "stacking": {
++              "mode": "normal",
++              "group": "A"
++            }
++          }
++        },
++        "overrides": []
++      },
++      "options": {
++        "legend": {
++          "displayMode": "table",
++          "placement": "right",
++          "calcs": [
++            "mean",
++            "max",
++            "lastNotNull"
++          ],
++          "showLegend": true
++        },
++        "tooltip": {
++          "mode": "multi",
++          "sort": "desc"
++        }
++      }
++    },
++    {
++      "type": "timeseries",
++      "title": "Messages consumed / min by role and outcome",
++      "id": 25,
++      "datasource": {
++        "type": "prometheus",
++        "uid": "${datasource}"
++      },
++      "description": "fast: the rejections topic, ON_HOLD records included (skipped). slow: the analysis queue. dlt, dlt_analysis: the DLT lane. Counted in the consumers; reported through start.py's metrics directory, so not on Windows.",
++      "gridPos": {
++        "h": 8,
++        "w": 12,
++        "x": 0,
++        "y": 26
++      },
+       "targets": [
+         {
+           "datasource": {
+@@ -1474,7 +1655,7 @@
+     {
+       "type": "timeseries",
+       "title": "Messages skipped / min by role and reason",
+-      "id": 23,
++      "id": 26,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -1484,7 +1665,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 12,
+-        "y": 18
++        "y": 26
+       },
+       "targets": [
+         {
+@@ -1533,18 +1714,18 @@
+     },
+     {
+       "type": "bargauge",
+-      "title": "Packets by service (range)",
+-      "id": 24,
++      "title": "Packets by lane and service (range)",
++      "id": 27,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+       },
+-      "description": "Every packet the fetch stage received, by its service and whether the service gate admits it.",
++      "description": "Every packet the fetch stage received, by lane (rejection, or dlt for a dead-lettered record), service and whether that lane's service gate admits it.",
+       "gridPos": {
+         "h": 8,
+         "w": 12,
+         "x": 0,
+-        "y": 26
++        "y": 34
+       },
+       "targets": [
+         {
+@@ -1552,8 +1733,8 @@
+             "type": "prometheus",
+             "uid": "${datasource}"
+           },
+-          "expr": "sum by (service, enabled) (increase(agentic_resident_crm_fetch_stage_packets_total{namespace=~\"$namespace\", instance=~\"$instance\", service=~\"$service\"}[$__range]))",
+-          "legendFormat": "{{service}} (enabled={{enabled}})",
++          "expr": "sum by (lane, service, enabled) (increase(agentic_resident_crm_fetch_stage_packets_total{namespace=~\"$namespace\", instance=~\"$instance\", service=~\"$service\"}[$__range]))",
++          "legendFormat": "{{lane}} {{service}} (enabled={{enabled}})",
+           "refId": "A",
+           "instant": true,
+           "range": false
+@@ -1584,8 +1765,8 @@
+     },
+     {
+       "type": "timeseries",
+-      "title": "Fetch stage / min by service and outcome",
+-      "id": 25,
++      "title": "Fetch stage / min by lane, service and outcome",
++      "id": 28,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -1595,7 +1776,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 12,
+-        "y": 26
++        "y": 34
+       },
+       "targets": [
+         {
+@@ -1603,8 +1784,8 @@
+             "type": "prometheus",
+             "uid": "${datasource}"
+           },
+-          "expr": "sum by (service, outcome) (rate(agentic_resident_crm_fetch_stage_packets_total{namespace=~\"$namespace\", instance=~\"$instance\", service=~\"$service\"}[$__rate_interval])) * 60",
+-          "legendFormat": "{{service}} {{outcome}}",
++          "expr": "sum by (lane, service, outcome) (rate(agentic_resident_crm_fetch_stage_packets_total{namespace=~\"$namespace\", instance=~\"$instance\", service=~\"$service\"}[$__rate_interval])) * 60",
++          "legendFormat": "{{lane}} {{service}} {{outcome}}",
+           "refId": "A"
+         }
+       ],
+@@ -1645,7 +1826,7 @@
+     {
+       "type": "timeseries",
+       "title": "Forwards to the API / min by endpoint and outcome",
+-      "id": 26,
++      "id": 29,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -1655,7 +1836,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 0,
+-        "y": 34
++        "y": 42
+       },
+       "targets": [
+         {
+@@ -1705,7 +1886,7 @@
+     {
+       "type": "timeseries",
+       "title": "Forward latency p95 by endpoint",
+-      "id": 27,
++      "id": 30,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -1715,7 +1896,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 12,
+-        "y": 34
++        "y": 42
+       },
+       "targets": [
+         {
+@@ -1765,20 +1946,20 @@
+     {
+       "type": "row",
+       "title": "Rejection lane: packets",
+-      "id": 28,
++      "id": 31,
+       "collapsed": false,
+       "gridPos": {
+         "h": 1,
+         "w": 24,
+         "x": 0,
+-        "y": 42
++        "y": 50
+       },
+       "panels": []
+     },
+     {
+       "type": "timeseries",
+       "title": "Packets / min by status",
+-      "id": 29,
++      "id": 32,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -1788,7 +1969,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 0,
+-        "y": 43
++        "y": 51
+       },
+       "targets": [
+         {
+@@ -1838,7 +2019,7 @@
+     {
+       "type": "timeseries",
+       "title": "Packets / min by service",
+-      "id": 30,
++      "id": 33,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -1848,7 +2029,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 12,
+-        "y": 43
++        "y": 51
+       },
+       "targets": [
+         {
+@@ -1898,7 +2079,7 @@
+     {
+       "type": "timeseries",
+       "title": "Packet duration (p50 / p95 / p99)",
+-      "id": 31,
++      "id": 34,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -1908,7 +2089,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 0,
+-        "y": 51
++        "y": 59
+       },
+       "targets": [
+         {
+@@ -1976,7 +2157,7 @@
+     {
+       "type": "timeseries",
+       "title": "p95 duration by resolution source / service",
+-      "id": 32,
++      "id": 35,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -1986,7 +2167,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 12,
+-        "y": 51
++        "y": 59
+       },
+       "targets": [
+         {
+@@ -2036,7 +2217,7 @@
+     {
+       "type": "timeseries",
+       "title": "Analysis claims / min",
+-      "id": 33,
++      "id": 36,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -2046,7 +2227,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 0,
+-        "y": 59
++        "y": 67
+       },
+       "targets": [
+         {
+@@ -2096,7 +2277,7 @@
+     {
+       "type": "timeseries",
+       "title": "Rejections skipped / min (gate=enforce)",
+-      "id": 34,
++      "id": 37,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -2106,7 +2287,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 12,
+-        "y": 59
++        "y": 67
+       },
+       "targets": [
+         {
+@@ -2156,7 +2337,7 @@
+     {
+       "type": "timeseries",
+       "title": "Service resolutions by source",
+-      "id": 35,
++      "id": 38,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -2166,7 +2347,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 0,
+-        "y": 67
++        "y": 75
+       },
+       "targets": [
+         {
+@@ -2216,7 +2397,7 @@
+     {
+       "type": "timeseries",
+       "title": "Investigator retries (avg / p90)",
+-      "id": 36,
++      "id": 39,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -2226,7 +2407,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 12,
+-        "y": 67
++        "y": 75
+       },
+       "targets": [
+         {
+@@ -2285,20 +2466,20 @@
+     {
+       "type": "row",
+       "title": "Rejection lane: knowledge sources",
+-      "id": 37,
++      "id": 40,
+       "collapsed": false,
+       "gridPos": {
+         "h": 1,
+         "w": 24,
+         "x": 0,
+-        "y": 75
++        "y": 83
+       },
+       "panels": []
+     },
+     {
+       "type": "timeseries",
+       "title": "Runbook lookups / min by outcome",
+-      "id": 38,
++      "id": 41,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -2308,7 +2489,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 0,
+-        "y": 76
++        "y": 84
+       },
+       "targets": [
+         {
+@@ -2358,7 +2539,7 @@
+     {
+       "type": "timeseries",
+       "title": "Runbook hit rate by service",
+-      "id": 39,
++      "id": 42,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -2368,7 +2549,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 12,
+-        "y": 76
++        "y": 84
+       },
+       "targets": [
+         {
+@@ -2420,7 +2601,7 @@
+     {
+       "type": "timeseries",
+       "title": "Reason-code doc lookups / min",
+-      "id": 40,
++      "id": 43,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -2430,7 +2611,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 0,
+-        "y": 84
++        "y": 92
+       },
+       "targets": [
+         {
+@@ -2480,7 +2661,7 @@
+     {
+       "type": "timeseries",
+       "title": "Reason-code doc miss rate by service",
+-      "id": 41,
++      "id": 44,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -2490,7 +2671,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 12,
+-        "y": 84
++        "y": 92
+       },
+       "targets": [
+         {
+@@ -2542,7 +2723,7 @@
+     {
+       "type": "timeseries",
+       "title": "Prompt trims / min by node",
+-      "id": 42,
++      "id": 45,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -2552,7 +2733,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 0,
+-        "y": 92
++        "y": 100
+       },
+       "targets": [
+         {
+@@ -2602,7 +2783,7 @@
+     {
+       "type": "timeseries",
+       "title": "Shadow runbook divergence / hour",
+-      "id": 43,
++      "id": 46,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -2612,7 +2793,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 12,
+-        "y": 92
++        "y": 100
+       },
+       "targets": [
+         {
+@@ -2662,20 +2843,20 @@
+     {
+       "type": "row",
+       "title": "LLM",
+-      "id": 44,
++      "id": 47,
+       "collapsed": false,
+       "gridPos": {
+         "h": 1,
+         "w": 24,
+         "x": 0,
+-        "y": 100
++        "y": 108
+       },
+       "panels": []
+     },
+     {
+       "type": "timeseries",
+       "title": "Tokens / min by node and direction",
+-      "id": 45,
++      "id": 48,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -2685,7 +2866,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 0,
+-        "y": 101
++        "y": 109
+       },
+       "targets": [
+         {
+@@ -2735,7 +2916,7 @@
+     {
+       "type": "timeseries",
+       "title": "LLM calls / min by node and outcome",
+-      "id": 46,
++      "id": 49,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -2745,7 +2926,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 12,
+-        "y": 101
++        "y": 109
+       },
+       "targets": [
+         {
+@@ -2795,7 +2976,7 @@
+     {
+       "type": "timeseries",
+       "title": "LLM non-ok share by node",
+-      "id": 47,
++      "id": 50,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -2805,7 +2986,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 0,
+-        "y": 109
++        "y": 117
+       },
+       "targets": [
+         {
+@@ -2856,7 +3037,7 @@
+     {
+       "type": "timeseries",
+       "title": "Avg tokens per packet (rejection lane)",
+-      "id": 48,
++      "id": 51,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -2866,7 +3047,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 12,
+-        "y": 109
++        "y": 117
+       },
+       "targets": [
+         {
+@@ -2916,20 +3097,20 @@
+     {
+       "type": "row",
+       "title": "Log pipeline",
+-      "id": 49,
++      "id": 52,
+       "collapsed": false,
+       "gridPos": {
+         "h": 1,
+         "w": 24,
+         "x": 0,
+-        "y": 117
++        "y": 125
+       },
+       "panels": []
+     },
+     {
+       "type": "timeseries",
+       "title": "Packet log fetches / min by lane and outcome",
+-      "id": 50,
++      "id": 53,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -2939,7 +3120,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 0,
+-        "y": 118
++        "y": 126
+       },
+       "targets": [
+         {
+@@ -2989,7 +3170,7 @@
+     {
+       "type": "timeseries",
+       "title": "Packet log fetch problems / min by service and outcome",
+-      "id": 51,
++      "id": 54,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -2999,7 +3180,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 12,
+-        "y": 118
++        "y": 126
+       },
+       "targets": [
+         {
+@@ -3049,7 +3230,7 @@
+     {
+       "type": "timeseries",
+       "title": "Kubernetes pod log reads / min by outcome",
+-      "id": 52,
++      "id": 55,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -3059,7 +3240,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 0,
+-        "y": 126
++        "y": 134
+       },
+       "targets": [
+         {
+@@ -3109,7 +3290,7 @@
+     {
+       "type": "timeseries",
+       "title": "Log fetches / min by source and outcome",
+-      "id": 53,
++      "id": 56,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -3119,7 +3300,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 12,
+-        "y": 126
++        "y": 134
+       },
+       "targets": [
+         {
+@@ -3169,7 +3350,7 @@
+     {
+       "type": "timeseries",
+       "title": "Log fetch failure share by source",
+-      "id": 54,
++      "id": 57,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -3179,7 +3360,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 0,
+-        "y": 134
++        "y": 142
+       },
+       "targets": [
+         {
+@@ -3230,7 +3411,7 @@
+     {
+       "type": "timeseries",
+       "title": "Log fetch latency p95 by source",
+-      "id": 55,
++      "id": 58,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -3240,7 +3421,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 12,
+-        "y": 134
++        "y": 142
+       },
+       "targets": [
+         {
+@@ -3290,7 +3471,7 @@
+     {
+       "type": "timeseries",
+       "title": "Records per fetch (p50 / p95) by source",
+-      "id": 56,
++      "id": 59,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -3300,7 +3481,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 0,
+-        "y": 142
++        "y": 150
+       },
+       "targets": [
+         {
+@@ -3359,7 +3540,7 @@
+     {
+       "type": "timeseries",
+       "title": "Evidence gaps / hour by type",
+-      "id": 57,
++      "id": 60,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -3369,7 +3550,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 12,
+-        "y": 142
++        "y": 150
+       },
+       "targets": [
+         {
+@@ -3419,7 +3600,7 @@
+     {
+       "type": "timeseries",
+       "title": "PII redactions / min by pattern",
+-      "id": 58,
++      "id": 61,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -3429,7 +3610,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 0,
+-        "y": 150
++        "y": 158
+       },
+       "targets": [
+         {
+@@ -3479,20 +3660,20 @@
+     {
+       "type": "row",
+       "title": "External dependencies: S3",
+-      "id": 59,
++      "id": 62,
+       "collapsed": false,
+       "gridPos": {
+         "h": 1,
+         "w": 24,
+         "x": 0,
+-        "y": 158
++        "y": 166
+       },
+       "panels": []
+     },
+     {
+       "type": "timeseries",
+       "title": "S3 requests / min by operation and outcome",
+-      "id": 60,
++      "id": 63,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -3502,7 +3683,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 0,
+-        "y": 159
++        "y": 167
+       },
+       "targets": [
+         {
+@@ -3552,7 +3733,7 @@
+     {
+       "type": "timeseries",
+       "title": "S3 error share by operation",
+-      "id": 61,
++      "id": 64,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -3562,7 +3743,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 12,
+-        "y": 159
++        "y": 167
+       },
+       "targets": [
+         {
+@@ -3613,7 +3794,7 @@
+     {
+       "type": "timeseries",
+       "title": "S3 upload / download latency (p50 / p95 / p99)",
+-      "id": 62,
++      "id": 65,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -3623,7 +3804,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 0,
+-        "y": 167
++        "y": 175
+       },
+       "targets": [
+         {
+@@ -3691,7 +3872,7 @@
+     {
+       "type": "timeseries",
+       "title": "S3 latency p95 by operation and outcome",
+-      "id": 63,
++      "id": 66,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -3701,7 +3882,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 12,
+-        "y": 167
++        "y": 175
+       },
+       "targets": [
+         {
+@@ -3751,7 +3932,7 @@
+     {
+       "type": "timeseries",
+       "title": "S3 errors / min by operation and error",
+-      "id": 64,
++      "id": 67,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -3761,7 +3942,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 0,
+-        "y": 175
++        "y": 183
+       },
+       "targets": [
+         {
+@@ -3811,7 +3992,7 @@
+     {
+       "type": "timeseries",
+       "title": "S3 throughput by operation",
+-      "id": 65,
++      "id": 68,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -3821,7 +4002,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 12,
+-        "y": 175
++        "y": 183
+       },
+       "targets": [
+         {
+@@ -3871,20 +4052,20 @@
+     {
+       "type": "row",
+       "title": "External dependencies: Kafka",
+-      "id": 66,
++      "id": 69,
+       "collapsed": false,
+       "gridPos": {
+         "h": 1,
+         "w": 24,
+         "x": 0,
+-        "y": 183
++        "y": 191
+       },
+       "panels": []
+     },
+     {
+       "type": "timeseries",
+       "title": "Kafka requests / min by operation and outcome",
+-      "id": 67,
++      "id": 70,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -3894,7 +4075,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 0,
+-        "y": 184
++        "y": 192
+       },
+       "targets": [
+         {
+@@ -3944,7 +4125,7 @@
+     {
+       "type": "timeseries",
+       "title": "Kafka latency p95 by operation",
+-      "id": 68,
++      "id": 71,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -3954,7 +4135,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 12,
+-        "y": 184
++        "y": 192
+       },
+       "targets": [
+         {
+@@ -4004,7 +4185,7 @@
+     {
+       "type": "timeseries",
+       "title": "Kafka errors / min by operation and error",
+-      "id": 69,
++      "id": 72,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -4014,7 +4195,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 0,
+-        "y": 192
++        "y": 200
+       },
+       "targets": [
+         {
+@@ -4064,7 +4245,7 @@
+     {
+       "type": "timeseries",
+       "title": "Kafka bytes published by operation",
+-      "id": 70,
++      "id": 73,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -4074,7 +4255,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 12,
+-        "y": 192
++        "y": 200
+       },
+       "targets": [
+         {
+@@ -4124,20 +4305,20 @@
+     {
+       "type": "row",
+       "title": "External dependencies: MySQL (checkpoints)",
+-      "id": 71,
++      "id": 74,
+       "collapsed": false,
+       "gridPos": {
+         "h": 1,
+         "w": 24,
+         "x": 0,
+-        "y": 200
++        "y": 208
+       },
+       "panels": []
+     },
+     {
+       "type": "timeseries",
+       "title": "MySQL requests / min by operation and outcome",
+-      "id": 72,
++      "id": 75,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -4147,7 +4328,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 0,
+-        "y": 201
++        "y": 209
+       },
+       "targets": [
+         {
+@@ -4197,7 +4378,7 @@
+     {
+       "type": "timeseries",
+       "title": "MySQL error share by operation",
+-      "id": 73,
++      "id": 76,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -4207,7 +4388,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 12,
+-        "y": 201
++        "y": 209
+       },
+       "targets": [
+         {
+@@ -4258,7 +4439,7 @@
+     {
+       "type": "timeseries",
+       "title": "MySQL checkpoint read / write latency (p50 / p95 / p99)",
+-      "id": 74,
++      "id": 77,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -4268,7 +4449,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 0,
+-        "y": 209
++        "y": 217
+       },
+       "targets": [
+         {
+@@ -4336,7 +4517,7 @@
+     {
+       "type": "timeseries",
+       "title": "MySQL latency p95 by operation and outcome",
+-      "id": 75,
++      "id": 78,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -4346,7 +4527,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 12,
+-        "y": 209
++        "y": 217
+       },
+       "targets": [
+         {
+@@ -4396,7 +4577,7 @@
+     {
+       "type": "timeseries",
+       "title": "MySQL errors / min by operation and error",
+-      "id": 76,
++      "id": 79,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -4406,7 +4587,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 0,
+-        "y": 217
++        "y": 225
+       },
+       "targets": [
+         {
+@@ -4456,7 +4637,7 @@
+     {
+       "type": "timeseries",
+       "title": "MySQL connections opened / hour by outcome",
+-      "id": 77,
++      "id": 80,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -4466,7 +4647,7 @@
+         "h": 8,
+         "w": 12,
+         "x": 12,
+-        "y": 217
++        "y": 225
+       },
+       "targets": [
+         {
+@@ -4516,20 +4697,20 @@
+     {
+       "type": "row",
+       "title": "Circuit breakers",
+-      "id": 78,
++      "id": 81,
+       "collapsed": false,
+       "gridPos": {
+         "h": 1,
+         "w": 24,
+         "x": 0,
+-        "y": 225
++        "y": 233
+       },
+       "panels": []
+     },
+     {
+       "type": "state-timeline",
+       "title": "Breaker state",
+-      "id": 79,
++      "id": 82,
+       "datasource": {
+         "type": "prometheus",
+         "uid": "${datasource}"
+@@ -4539,7 +4720,7 @@
+         "h": 8,
+         "w": 24,
+         "x": 0,
+-        "y": 226
++        "y": 234
+       },
+       "targets": [
+         {
+@@ -4620,19 +4801,19 @@
+     {
+       "type": "row",
+       "title": "DLT lane",
+-      "id": 80,
++      "id": 83,
+       "collapsed": true,
+       "gridPos": {
+         "h": 1,
+         "w": 24,
+         "x": 0,
+-        "y": 234
++        "y": 242
+       },
+       "panels": [
+         {
+           "type": "timeseries",
+           "title": "DLT cases / min by failure class",
+-          "id": 81,
++          "id": 84,
+           "datasource": {
+             "type": "prometheus",
+             "uid": "${datasource}"
+@@ -4642,7 +4823,7 @@
+             "h": 8,
+             "w": 12,
+             "x": 0,
+-            "y": 235
++            "y": 243
+           },
+           "targets": [
+             {
+@@ -4692,7 +4873,7 @@
+         {
+           "type": "piechart",
+           "title": "Reuse decisions (range)",
+-          "id": 82,
++          "id": 85,
+           "datasource": {
+             "type": "prometheus",
+             "uid": "${datasource}"
+@@ -4702,7 +4883,7 @@
+             "h": 8,
+             "w": 6,
+             "x": 12,
+-            "y": 235
++            "y": 243
+           },
+           "targets": [
+             {
+@@ -4752,7 +4933,7 @@
+         {
+           "type": "piechart",
+           "title": "Code-check verdicts (range)",
+-          "id": 83,
++          "id": 86,
+           "datasource": {
+             "type": "prometheus",
+             "uid": "${datasource}"
+@@ -4762,7 +4943,7 @@
+             "h": 8,
+             "w": 6,
+             "x": 18,
+-            "y": 235
++            "y": 243
+           },
+           "targets": [
+             {
+@@ -4812,7 +4993,7 @@
+         {
+           "type": "timeseries",
+           "title": "Corroboration verdicts / min",
+-          "id": 84,
++          "id": 87,
+           "datasource": {
+             "type": "prometheus",
+             "uid": "${datasource}"
+@@ -4822,7 +5003,7 @@
+             "h": 8,
+             "w": 12,
+             "x": 0,
+-            "y": 243
++            "y": 251
+           },
+           "targets": [
+             {
+@@ -4872,7 +5053,7 @@
+         {
+           "type": "timeseries",
+           "title": "Single-flight outcomes / min",
+-          "id": 85,
++          "id": 88,
+           "datasource": {
+             "type": "prometheus",
+             "uid": "${datasource}"
+@@ -4882,7 +5063,7 @@
+             "h": 8,
+             "w": 12,
+             "x": 12,
+-            "y": 243
++            "y": 251
+           },
+           "targets": [
+             {
+@@ -4932,7 +5113,7 @@
+         {
+           "type": "timeseries",
+           "title": "DLT claims / min",
+-          "id": 86,
++          "id": 89,
+           "datasource": {
+             "type": "prometheus",
+             "uid": "${datasource}"
+@@ -4942,7 +5123,7 @@
+             "h": 8,
+             "w": 12,
+             "x": 0,
+-            "y": 251
++            "y": 259
+           },
+           "targets": [
+             {
+@@ -4992,7 +5173,7 @@
+         {
+           "type": "timeseries",
+           "title": "Group writes / min by operation and outcome",
+-          "id": 87,
++          "id": 90,
+           "datasource": {
+             "type": "prometheus",
+             "uid": "${datasource}"
+@@ -5002,7 +5183,7 @@
+             "h": 8,
+             "w": 12,
+             "x": 12,
+-            "y": 251
++            "y": 259
+           },
+           "targets": [
+             {
+@@ -5052,7 +5233,7 @@
+         {
+           "type": "timeseries",
+           "title": "Service resolutions / min by source",
+-          "id": 88,
++          "id": 91,
+           "datasource": {
+             "type": "prometheus",
+             "uid": "${datasource}"
+@@ -5062,7 +5243,7 @@
+             "h": 8,
+             "w": 12,
+             "x": 0,
+-            "y": 259
++            "y": 267
+           },
+           "targets": [
+             {
+@@ -5112,7 +5293,7 @@
+         {
+           "type": "timeseries",
+           "title": "DLT skipped / min (gate=enforce)",
+-          "id": 89,
++          "id": 92,
+           "datasource": {
+             "type": "prometheus",
+             "uid": "${datasource}"
+@@ -5122,7 +5303,7 @@
+             "h": 8,
+             "w": 12,
+             "x": 12,
+-            "y": 259
++            "y": 267
+           },
+           "targets": [
+             {
+@@ -5172,7 +5353,7 @@
+         {
+           "type": "timeseries",
+           "title": "Auto-replay outcomes / min",
+-          "id": 90,
++          "id": 93,
+           "datasource": {
+             "type": "prometheus",
+             "uid": "${datasource}"
+@@ -5182,7 +5363,7 @@
+             "h": 8,
+             "w": 12,
+             "x": 0,
+-            "y": 267
++            "y": 275
+           },
+           "targets": [
+             {
+@@ -5232,7 +5413,7 @@
+         {
+           "type": "timeseries",
+           "title": "Deployed-version reads / min",
+-          "id": 91,
++          "id": 94,
+           "datasource": {
+             "type": "prometheus",
+             "uid": "${datasource}"
+@@ -5242,7 +5423,7 @@
+             "h": 8,
+             "w": 12,
+             "x": 12,
+-            "y": 267
++            "y": 275
+           },
+           "targets": [
+             {
+@@ -5292,7 +5473,7 @@
+         {
+           "type": "timeseries",
+           "title": "Log window age at fetch (p50 / p95)",
+-          "id": 92,
++          "id": 95,
+           "datasource": {
+             "type": "prometheus",
+             "uid": "${datasource}"
+@@ -5302,7 +5483,7 @@
+             "h": 8,
+             "w": 12,
+             "x": 0,
+-            "y": 275
++            "y": 283
+           },
+           "targets": [
+             {
+@@ -5361,7 +5542,7 @@
+         {
+           "type": "timeseries",
+           "title": "Registry misses and per-code violations / hour",
+-          "id": 93,
++          "id": 96,
+           "datasource": {
+             "type": "prometheus",
+             "uid": "${datasource}"
+@@ -5371,7 +5552,7 @@
+             "h": 8,
+             "w": 12,
+             "x": 12,
+-            "y": 275
++            "y": 283
+           },
+           "targets": [
+             {
